@@ -1,0 +1,31 @@
+name: Daily Product Picker
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 23:00 UTC is 08:00 JST on the following calendar day.
+    - cron: "0 23 * * *"
+
+concurrency:
+  group: daily-product-picker
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    if: github.event_name == 'workflow_dispatch' || vars.DAILY_SCHEDULE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+      - name: Run daily pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_TRIAGE_MODEL: gemini-3.5-flash-lite
+        run: python run_daily.py

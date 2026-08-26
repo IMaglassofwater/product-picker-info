@@ -1,0 +1,8 @@
+python-dotenv
+pydantic
+requests
+pytest
+openai
+google-genai
+streamlit
+psycopg[binary,pool]
