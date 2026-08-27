@@ -28,6 +28,7 @@ from dashboard_data import (
     enqueue_re_evaluation,
     filter_products,
     load_dashboard_snapshot,
+    page_records,
     save_manual_status,
 )
 from daily_ranker import load_current_opportunities, select_daily_top, select_full_qualified
@@ -313,6 +314,11 @@ def all_products_page(snapshot) -> None:
         queued = {row["entity_id"] for row in snapshot.re_evaluation_queue if row["entity_type"] == "product"}
         products = [product for product in products if str(product.id) in queued]
     st.metric("当前筛选结果 · Current Results", len(products))
+    current_page = min(max(1, st.session_state.get("all-results-page-number", 1)), max(1, math.ceil(len(products) / 50)))
+    diagnostic_columns = st.columns(3)
+    diagnostic_columns[0].metric("All Products Query", len(snapshot.products))
+    diagnostic_columns[1].metric("Filtered", len(products))
+    diagnostic_columns[2].metric("Page Records", len(page_records(products, current_page, 50)))
     paginated_cards(products, "all-results", 50)
 
 
@@ -350,16 +356,21 @@ database_columns[0].metric(
 )
 database_columns[1].metric("连接状态 / Connection", "Connected")
 database_columns[2].metric("产品记录 / Products", len(snapshot.products))
-tabs = st.tabs(NAVIGATION_TABS)
-with tabs[0]:
+selected_page = st.radio(
+    "页面导航 · Navigation",
+    NAVIGATION_TABS,
+    horizontal=True,
+    label_visibility="collapsed",
+)
+if selected_page == NAVIGATION_TABS[0]:
     today_page(snapshot)
-with tabs[1]:
+elif selected_page == NAVIGATION_TABS[1]:
     all_products_page(snapshot)
-with tabs[2]:
+elif selected_page == NAVIGATION_TABS[2]:
     software_page(snapshot)
-with tabs[3]:
+elif selected_page == NAVIGATION_TABS[3]:
     manual_page(snapshot, "FAVORITE", "我的收藏 · Favorites", "favorites")
-with tabs[4]:
+elif selected_page == NAVIGATION_TABS[4]:
     manual_page(snapshot, "WATCH", "观察列表 · Watchlist", "watchlist")
-with tabs[5]:
+else:
     rejected_page(snapshot)
