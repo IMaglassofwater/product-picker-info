@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
-from typing import Iterable
+from typing import Iterable, TypeVar
 
 import db
 from software_analysis import stable_candidate_id
@@ -25,6 +25,7 @@ SOURCE_LABELS = {
 }
 AI_STATUSES = ("PASS", "REVIEW", "REJECT", "AI_PENDING", "NOT_ANALYZED")
 MANUAL_STATUSES = ("FAVORITE", "WATCH", "NOT_INTERESTED")
+T = TypeVar("T")
 
 
 @dataclass
@@ -266,6 +267,23 @@ def load_dashboard_snapshot() -> DashboardSnapshot:
     run_info = dict(latest_run) if latest_run else {}
     pipeline_sources = [dict(row) | {"run": run_info} for row in pipeline_rows]
     return DashboardSnapshot(products, pipeline_sources, [dict(row) for row in queue_rows])
+
+
+def get_all_products_dashboard() -> list[DashboardProduct]:
+    """Return every product for the All Products page without qualification filters.
+
+    Products are loaded as the primary dataset. Candidate, Gemini, specificity,
+    feedback, and analysis records only enrich matching products and never
+    determine whether a product is returned.
+    """
+    return load_dashboard_snapshot().products
+
+
+def page_records(items: list[T], page: int = 1, page_size: int = 50) -> list[T]:
+    """Return one bounded page without changing or filtering the input."""
+    safe_page = max(1, page)
+    start = (safe_page - 1) * page_size
+    return items[start:start + page_size]
 
 
 def filter_products(products: Iterable[DashboardProduct], filters: ProductFilters) -> list[DashboardProduct]:

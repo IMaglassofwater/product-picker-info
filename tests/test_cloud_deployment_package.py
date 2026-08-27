@@ -120,6 +120,10 @@ def test_streamlit_bootstraps_secret_before_dashboard_and_shows_safe_status():
     assert "连接状态 / Connection" in app
     assert "产品记录 / Products" in app
     assert "DATABASE_SETTINGS.database_url" not in app
+    assert "st.tabs" not in app
+    assert "selected_page = st.radio" in app
+    assert "All Products Query" in app
+    assert "Page Records" in app
 
 
 def test_feedback_actions_use_shared_database_backend():

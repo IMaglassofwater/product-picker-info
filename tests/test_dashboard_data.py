@@ -9,6 +9,7 @@ from dashboard_data import (
     clear_manual_status,
     enqueue_re_evaluation,
     filter_products,
+    get_all_products_dashboard,
     load_dashboard_snapshot,
     save_manual_status,
 )
@@ -43,6 +44,37 @@ def test_empty_description_remains_loadable_and_not_analyzed(tmp_path, monkeypat
     assert db.get_all_products()[0].description == ""
     item = load_dashboard_snapshot().products[0]
     assert item.description == ""
+    assert item.gemini_status == "NOT_ANALYZED"
+
+
+def test_all_products_query_keeps_products_without_related_records(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    db.save_products([
+        product(1, description="No related rows"),
+        product(2, source="product_hunt", description="Software without AI"),
+    ])
+    with db._connect() as connection:
+        connection.execute(
+            "UPDATE products SET record_role='software', opportunity_type='software' WHERE project_id='p2'"
+        )
+
+    items = get_all_products_dashboard()
+
+    assert len(items) == 2
+    assert {item.gemini_status for item in items} == {"NOT_ANALYZED", "AI_PENDING"}
+    assert any(item.display_type == "software" and item.gemini_status == "AI_PENDING" for item in items)
+
+
+def test_nullable_postgres_compatible_timestamps_do_not_remove_product(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    db.create_product(product())
+    with db._connect() as connection:
+        connection.execute(
+            "UPDATE products SET first_seen_at=NULL, last_seen_at=NULL WHERE project_id='p1'"
+        )
+    item = get_all_products_dashboard()[0]
+    assert item.first_seen_at
+    assert item.last_seen_at
     assert item.gemini_status == "NOT_ANALYZED"
 
 

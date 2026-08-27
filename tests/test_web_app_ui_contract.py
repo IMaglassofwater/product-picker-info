@@ -11,13 +11,14 @@ from dashboard_data import ProductFilters, filter_products, load_dashboard_snaps
 APP_SOURCE = Path("app.py").read_text(encoding="utf-8")
 
 
-def test_six_visible_top_navigation_tabs_are_defined():
+def test_six_visible_top_navigation_pages_are_defined():
     labels = (
         "🔥 今日机会 / Today", "📦 全部产品 / All Products",
         "💻 软件机会 / Software", "❤️ 我的收藏 / Favorites",
         "👀 观察列表 / Watchlist", "🗑 淘汰库 / Rejected",
     )
-    assert "st.tabs(NAVIGATION_TABS)" in APP_SOURCE
+    assert "selected_page = st.radio" in APP_SOURCE
+    assert "horizontal=True" in APP_SOURCE
     assert all(label in APP_SOURCE for label in labels)
     assert "st.sidebar.radio" not in APP_SOURCE
 
