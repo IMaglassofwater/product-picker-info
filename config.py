@@ -95,3 +95,13 @@ GEMINI_KEY_PLACEHOLDERS = {"", "PASTE_YOUR_GEMINI_API_KEY_HERE", "YOUR_GEMINI_AP
 def is_gemini_configured() -> bool:
     """Return whether a non-placeholder Gemini API key is configured."""
     return GEMINI_API_KEY not in GEMINI_KEY_PLACEHOLDERS
+
+
+def _positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(_config_value(name) or default))
+    except ValueError:
+        return default
+
+
+MAX_DAILY_TRIAGE_CALLS = _positive_int("MAX_DAILY_TRIAGE_CALLS", 30)

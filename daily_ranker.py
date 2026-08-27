@@ -68,6 +68,7 @@ class OpportunityInput:
     software_analysis: SoftwareAnalysisResult | None = None
     theme: str = "other"
     opportunity_group: str | None = None
+    manual_status: str = ""
 
     @property
     def display_title(self) -> str:
@@ -247,6 +248,8 @@ def score_candidate(
 
 
 def apply_quality_gate(candidate: OpportunityInput) -> tuple[bool, str]:
+    if candidate.manual_status == "NOT_INTERESTED":
+        return False, "not_interested"
     if candidate.triage is None or candidate.triage.provider != "gemini":
         return False, "missing_triage"
     if candidate.triage.triage_status == "REJECT":
@@ -500,9 +503,15 @@ def load_current_opportunities() -> list[OpportunityInput]:
     output: list[OpportunityInput] = []
     included_candidate_urls: set[str] = set()
     with db._connect() as connection:
+        feedback = {
+            (row["entity_type"], row["entity_id"]): row["feedback_type"]
+            for row in connection.execute(
+                "SELECT entity_type, entity_id, feedback_type FROM user_product_feedback"
+            ).fetchall()
+        }
         metadata = {
             row["url"]: row for row in connection.execute(
-                """SELECT url, opportunity_type, risk_flags, positive_signals,
+                """SELECT id, url, opportunity_type, risk_flags, positive_signals,
                    commodity_flags, created_at, raw_data, filter_score,
                    record_role FROM products"""
             ).fetchall()
@@ -518,6 +527,9 @@ def load_current_opportunities() -> list[OpportunityInput]:
             physical = (db.get_deep_analysis_result(candidate.candidate_id, "gemini", "gemini-3.5-flash-lite", "v2")
                         or db.get_deep_analysis_result(candidate.candidate_id, "gemini", "gemini-3.5-flash-lite", "v1"))
             raw = product.raw_data if product else {}
+            manual_status = feedback.get(("candidate", candidate.candidate_id), "")
+            if not manual_status and row:
+                manual_status = feedback.get(("product", str(row["id"])), "")
             output.append(OpportunityInput(
                 candidate_id=candidate.candidate_id, title=candidate.title,
                 summary=candidate.summary, opportunity_type="Physical",
@@ -533,6 +545,7 @@ def load_current_opportunities() -> list[OpportunityInput]:
                 physical_analysis=physical,
                 theme=infer_theme(candidate.title, candidate.summary),
                 opportunity_group=infer_opportunity_group(candidate.title, candidate.summary),
+                manual_status=manual_status,
             ))
             included_candidate_urls.add(candidate.source_url)
         for url, row in metadata.items():
@@ -542,6 +555,9 @@ def load_current_opportunities() -> list[OpportunityInput]:
             candidate_id = stable_candidate_id(product)
             triage = db.get_triage_result(candidate_id, "gemini", "gemini-3.5-flash-lite")
             software = db.get_software_analysis_result(candidate_id, "gemini", "gemini-3.5-flash-lite", "v1")
+            manual_status = feedback.get(("candidate", candidate_id), "") or feedback.get(
+                ("product", str(row["id"])), ""
+            )
             output.append(OpportunityInput(
                 candidate_id=candidate_id, title=product.title, summary=product.description,
                 opportunity_type="Software", candidate_type="software",
@@ -550,6 +566,7 @@ def load_current_opportunities() -> list[OpportunityInput]:
                 raw_data=product.raw_data, created_at=(row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else row["created_at"]), triage=triage,
                 software_analysis=software, theme="software",
                 opportunity_group=infer_opportunity_group(product.title, product.description),
+                manual_status=manual_status,
             ))
     return output
 

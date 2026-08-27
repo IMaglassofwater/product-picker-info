@@ -188,7 +188,8 @@ def init_db() -> bool:
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     status TEXT NOT NULL,
-                    error TEXT NOT NULL DEFAULT ''
+                    error TEXT NOT NULL DEFAULT '',
+                    stats_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS pipeline_source_runs (
@@ -244,6 +245,7 @@ def init_db() -> bool:
             _ensure_lifecycle_columns(connection)
             _ensure_triage_unique_key(connection)
             _ensure_triage_bilingual_columns(connection)
+            _ensure_pipeline_stats_column(connection)
         return True
     except (OSError, sqlite3.Error):
         return False
@@ -284,6 +286,14 @@ def _ensure_filter_columns(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE products ADD COLUMN {column_name} {definition}"
             )
+
+
+def _ensure_pipeline_stats_column(connection: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(pipeline_runs)")}
+    if "stats_json" not in existing:
+        connection.execute(
+            "ALTER TABLE pipeline_runs ADD COLUMN stats_json TEXT NOT NULL DEFAULT '{}'"
+        )
 
 
 def _ensure_lifecycle_columns(connection: sqlite3.Connection) -> None:
@@ -819,13 +829,15 @@ def record_pipeline_source_run(
         return False
 
 
-def finish_pipeline_run(run_id: str, status: str, error: str = "") -> bool:
+def finish_pipeline_run(
+    run_id: str, status: str, error: str = "", *, stats: dict | None = None
+) -> bool:
     try:
         with _connect() as connection:
             cursor = connection.execute(
-                """UPDATE pipeline_runs SET finished_at = ?, status = ?, error = ?
+                """UPDATE pipeline_runs SET finished_at = ?, status = ?, error = ?, stats_json = ?
                    WHERE run_id = ?""",
-                (_utc_now(), status, error[:1000], run_id),
+                (_utc_now(), status, error[:1000], json.dumps(stats or {}, ensure_ascii=False), run_id),
             )
         return cursor.rowcount == 1
     except sqlite3.Error:
@@ -900,6 +912,33 @@ def request_re_evaluation(
                 (entity_type, entity_id, note, now, now),
             )
         return True
+    except sqlite3.Error:
+        return False
+
+
+def get_pending_re_evaluations() -> list[dict]:
+    """Return the durable re-evaluation queue without changing it."""
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """SELECT id, entity_type, entity_id, note, created_at
+                   FROM re_evaluation_requests WHERE status='PENDING'
+                   ORDER BY created_at, id"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        return []
+
+
+def complete_re_evaluation(request_id: int) -> bool:
+    try:
+        with _connect() as connection:
+            cursor = connection.execute(
+                """UPDATE re_evaluation_requests SET status='COMPLETED', updated_at=?
+                   WHERE id=? AND status='PENDING'""",
+                (_utc_now(), request_id),
+            )
+        return cursor.rowcount == 1
     except sqlite3.Error:
         return False
 
