@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+from typing import Mapping, MutableMapping
 from urllib.parse import unquote, urlparse
 
 
@@ -38,6 +39,28 @@ def get_database_settings(database_url: str | None = None) -> DatabaseSettings:
             path = PROJECT_ROOT / path
         return DatabaseSettings("sqlite", raw, path.resolve())
     raise ValueError("DATABASE_URL must use sqlite://, postgres://, or postgresql://")
+
+
+def configure_database_environment(
+    secrets: Mapping[str, object] | None = None,
+    environ: MutableMapping[str, str] | None = None,
+) -> DatabaseSettings:
+    """Resolve env first, then a Streamlit-compatible secrets mapping.
+
+    This must run before importing ``db`` because that module intentionally
+    selects one backend for the process lifetime.
+    """
+    environment = environ if environ is not None else os.environ
+    raw = str(environment.get("DATABASE_URL", "") or "").strip()
+    if not raw and secrets is not None:
+        try:
+            secret_value = secrets.get("DATABASE_URL", "")
+        except (FileNotFoundError, KeyError, AttributeError):
+            secret_value = ""
+        raw = str(secret_value or "").strip()
+        if raw:
+            environment["DATABASE_URL"] = raw
+    return get_database_settings(raw)
 
 
 def require_postgres_url(value: str | None = None) -> str:
