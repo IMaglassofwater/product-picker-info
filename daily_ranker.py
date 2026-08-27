@@ -516,58 +516,99 @@ def load_current_opportunities() -> list[OpportunityInput]:
                    record_role FROM products"""
             ).fetchall()
         }
-        for candidate in candidate_rows:
-            row = metadata.get(candidate.source_url)
-            product = products.get(candidate.source_url)
-            if row and row["opportunity_type"] == "software":
-                continue
-            risk_value = row["risk_flags"] if row else []
-            risks = risk_value if isinstance(risk_value, list) else json.loads(risk_value)
-            triage = db.get_triage_result(candidate.candidate_id, "gemini", "gemini-3.5-flash-lite")
-            physical = (db.get_deep_analysis_result(candidate.candidate_id, "gemini", "gemini-3.5-flash-lite", "v2")
-                        or db.get_deep_analysis_result(candidate.candidate_id, "gemini", "gemini-3.5-flash-lite", "v1"))
-            raw = product.raw_data if product else {}
-            manual_status = feedback.get(("candidate", candidate.candidate_id), "")
-            if not manual_status and row:
-                manual_status = feedback.get(("product", str(row["id"])), "")
-            output.append(OpportunityInput(
-                candidate_id=candidate.candidate_id, title=candidate.title,
-                summary=candidate.summary, opportunity_type="Physical",
-                candidate_type=candidate.candidate_type,
-                source_platform=candidate.source_platform, source_url=candidate.source_url,
-                candidate_score=candidate.candidate_score,
-                feasibility_score=candidate.feasibility_score,
-                demand_score=candidate.demand_score,
-                market_validation_score=candidate.market_validation_score,
-                micro_innovation_score=candidate.micro_innovation_score,
-                signals=candidate.signals, risk_flags=risks, raw_data=raw,
-                created_at=(row["created_at"].isoformat() if row and hasattr(row["created_at"], "isoformat") else (row["created_at"] if row else "")), triage=triage,
-                physical_analysis=physical,
-                theme=infer_theme(candidate.title, candidate.summary),
-                opportunity_group=infer_opportunity_group(candidate.title, candidate.summary),
-                manual_status=manual_status,
-            ))
-            included_candidate_urls.add(candidate.source_url)
-        for url, row in metadata.items():
-            if url in included_candidate_urls or not (row["record_role"] == "software" or row["opportunity_type"] == "software"):
-                continue
-            product = products[url]
-            candidate_id = stable_candidate_id(product)
-            triage = db.get_triage_result(candidate_id, "gemini", "gemini-3.5-flash-lite")
-            software = db.get_software_analysis_result(candidate_id, "gemini", "gemini-3.5-flash-lite", "v1")
-            manual_status = feedback.get(("candidate", candidate_id), "") or feedback.get(
-                ("product", str(row["id"])), ""
+        triage_rows = connection.execute(
+            """SELECT * FROM ai_triage_results
+               WHERE provider = ? AND model = ?""",
+            ("gemini", "gemini-3.5-flash-lite"),
+        ).fetchall()
+        deep_rows = connection.execute(
+            """SELECT candidate_id, analysis_version, result_json
+               FROM deep_analysis_results
+               WHERE provider = ? AND model = ? AND analysis_version IN ('v1', 'v2')""",
+            ("gemini", "gemini-3.5-flash-lite"),
+        ).fetchall()
+        software_rows = connection.execute(
+            """SELECT candidate_id, result_json FROM software_analysis_results
+               WHERE provider = ? AND model = ? AND analysis_version = 'v1'""",
+            ("gemini", "gemini-3.5-flash-lite"),
+        ).fetchall()
+
+    triage_by_id = {row["candidate_id"]: db._triage_row_to_result(row) for row in triage_rows}
+    deep_by_key: dict[tuple[str, str], DeepAnalysisResult] = {}
+    for row in deep_rows:
+        try:
+            value = row["result_json"]
+            deep_by_key[(row["candidate_id"], row["analysis_version"])] = (
+                DeepAnalysisResult.model_validate(value)
+                if isinstance(value, dict)
+                else DeepAnalysisResult.model_validate_json(value)
             )
-            output.append(OpportunityInput(
-                candidate_id=candidate_id, title=product.title, summary=product.description,
-                opportunity_type="Software", candidate_type="software",
-                source_platform=product.source_platform, source_url=url,
-                candidate_score=row["filter_score"], signals=[], risk_flags=[],
-                raw_data=product.raw_data, created_at=(row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else row["created_at"]), triage=triage,
-                software_analysis=software, theme="software",
-                opportunity_group=infer_opportunity_group(product.title, product.description),
-                manual_status=manual_status,
-            ))
+        except ValueError:
+            continue
+    software_by_id: dict[str, SoftwareAnalysisResult] = {}
+    for row in software_rows:
+        try:
+            value = row["result_json"]
+            software_by_id[row["candidate_id"]] = (
+                SoftwareAnalysisResult.model_validate(value)
+                if isinstance(value, dict)
+                else SoftwareAnalysisResult.model_validate_json(value)
+            )
+        except ValueError:
+            continue
+
+    for candidate in candidate_rows:
+        row = metadata.get(candidate.source_url)
+        product = products.get(candidate.source_url)
+        if row and row["opportunity_type"] == "software":
+            continue
+        risk_value = row["risk_flags"] if row else []
+        risks = risk_value if isinstance(risk_value, list) else json.loads(risk_value)
+        triage = triage_by_id.get(candidate.candidate_id)
+        physical = (deep_by_key.get((candidate.candidate_id, "v2"))
+                    or deep_by_key.get((candidate.candidate_id, "v1")))
+        raw = product.raw_data if product else {}
+        manual_status = feedback.get(("candidate", candidate.candidate_id), "")
+        if not manual_status and row:
+            manual_status = feedback.get(("product", str(row["id"])), "")
+        output.append(OpportunityInput(
+            candidate_id=candidate.candidate_id, title=candidate.title,
+            summary=candidate.summary, opportunity_type="Physical",
+            candidate_type=candidate.candidate_type,
+            source_platform=candidate.source_platform, source_url=candidate.source_url,
+            candidate_score=candidate.candidate_score,
+            feasibility_score=candidate.feasibility_score,
+            demand_score=candidate.demand_score,
+            market_validation_score=candidate.market_validation_score,
+            micro_innovation_score=candidate.micro_innovation_score,
+            signals=candidate.signals, risk_flags=risks, raw_data=raw,
+            created_at=(row["created_at"].isoformat() if row and hasattr(row["created_at"], "isoformat") else (row["created_at"] if row else "")), triage=triage,
+            physical_analysis=physical,
+            theme=infer_theme(candidate.title, candidate.summary),
+            opportunity_group=infer_opportunity_group(candidate.title, candidate.summary),
+            manual_status=manual_status,
+        ))
+        included_candidate_urls.add(candidate.source_url)
+    for url, row in metadata.items():
+        if url in included_candidate_urls or not (row["record_role"] == "software" or row["opportunity_type"] == "software"):
+            continue
+        product = products[url]
+        candidate_id = stable_candidate_id(product)
+        triage = triage_by_id.get(candidate_id)
+        software = software_by_id.get(candidate_id)
+        manual_status = feedback.get(("candidate", candidate_id), "") or feedback.get(
+            ("product", str(row["id"])), ""
+        )
+        output.append(OpportunityInput(
+            candidate_id=candidate_id, title=product.title, summary=product.description,
+            opportunity_type="Software", candidate_type="software",
+            source_platform=product.source_platform, source_url=url,
+            candidate_score=row["filter_score"], signals=[], risk_flags=[],
+            raw_data=product.raw_data, created_at=(row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else row["created_at"]), triage=triage,
+            software_analysis=software, theme="software",
+            opportunity_group=infer_opportunity_group(product.title, product.description),
+            manual_status=manual_status,
+        ))
     return output
 
 
