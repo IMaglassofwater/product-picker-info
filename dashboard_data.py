@@ -279,7 +279,7 @@ def get_all_products_dashboard() -> list[DashboardProduct]:
     return load_dashboard_snapshot().products
 
 
-def page_records(items: list[T], page: int = 1, page_size: int = 50) -> list[T]:
+def page_records(items: list[T], page: int = 1, page_size: int = 20) -> list[T]:
     """Return one bounded page without changing or filtering the input."""
     safe_page = max(1, page)
     start = (safe_page - 1) * page_size

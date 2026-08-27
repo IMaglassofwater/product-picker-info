@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import logging
 
 import streamlit as st
 
@@ -37,6 +38,8 @@ import db
 
 
 st.set_page_config(page_title="Product Picker", page_icon="🧭", layout="wide")
+LOGGER = logging.getLogger(__name__)
+LIST_PAGE_SIZE = 20
 
 NAVIGATION_TABS = (
     "🔥 今日机会 / Today",
@@ -228,7 +231,7 @@ def filter_controls(products: list[DashboardProduct], prefix: str) -> ProductFil
     return ProductFilters(keyword, sources, date_range, types, rule, feasibility, commodity, specificity, gemini, manual)
 
 
-def paginated_cards(products: list[DashboardProduct], prefix: str, page_size: int = 50) -> None:
+def paginated_cards(products: list[DashboardProduct], prefix: str, page_size: int = LIST_PAGE_SIZE) -> int:
     pages = max(1, math.ceil(len(products) / page_size))
     state_key = f"{prefix}-page-number"
     st.session_state[state_key] = min(max(1, st.session_state.get(state_key, 1)), pages)
@@ -243,8 +246,16 @@ def paginated_cards(products: list[DashboardProduct], prefix: str, page_size: in
     start = (int(page) - 1) * page_size
     end = min(start + page_size, len(products))
     indicator.markdown(f"**显示 · Showing {start + 1 if products else 0}–{end} / {len(products)}**")
-    for product in products[start:start + page_size]:
-        product_card(product, prefix)
+    rendered = 0
+    for product in page_records(products, page, page_size):
+        try:
+            product_card(product, prefix)
+            rendered += 1
+        except Exception:
+            LOGGER.exception("Product card render failed for product_id=%s", product.id)
+            st.warning(f"无法显示该产品卡片 · Product card unavailable: {product.title}")
+    st.caption(f"Rendered Products: {rendered}")
+    return rendered
 
 
 def today_page(snapshot) -> None:
@@ -314,12 +325,12 @@ def all_products_page(snapshot) -> None:
         queued = {row["entity_id"] for row in snapshot.re_evaluation_queue if row["entity_type"] == "product"}
         products = [product for product in products if str(product.id) in queued]
     st.metric("当前筛选结果 · Current Results", len(products))
-    current_page = min(max(1, st.session_state.get("all-results-page-number", 1)), max(1, math.ceil(len(products) / 50)))
+    current_page = min(max(1, st.session_state.get("all-results-page-number", 1)), max(1, math.ceil(len(products) / LIST_PAGE_SIZE)))
     diagnostic_columns = st.columns(3)
     diagnostic_columns[0].metric("All Products Query", len(snapshot.products))
     diagnostic_columns[1].metric("Filtered", len(products))
-    diagnostic_columns[2].metric("Page Records", len(page_records(products, current_page, 50)))
-    paginated_cards(products, "all-results", 50)
+    diagnostic_columns[2].metric("Page Records", len(page_records(products, current_page, LIST_PAGE_SIZE)))
+    paginated_cards(products, "all-results", LIST_PAGE_SIZE)
 
 
 def software_page(snapshot) -> None:
@@ -327,14 +338,17 @@ def software_page(snapshot) -> None:
     software = [product for product in snapshot.products if product.display_type == "software"]
     gemini = tuple(st.multiselect("AI状态 · AI Status", AI_STATUSES, key="software-ai"))
     keyword = st.text_input("搜索 · Search", key="software-search")
-    paginated_cards(filter_products(software, ProductFilters(keyword=keyword, gemini_statuses=gemini)), "software")
+    paginated_cards(
+        filter_products(software, ProductFilters(keyword=keyword, gemini_statuses=gemini)),
+        "software", LIST_PAGE_SIZE,
+    )
 
 
 def manual_page(snapshot, status: str, title: str, prefix: str) -> None:
     st.header(title)
     keyword = st.text_input("搜索 · Search", key=f"{prefix}-search")
     products = filter_products(snapshot.products, ProductFilters(keyword=keyword, manual_statuses=(status,)))
-    paginated_cards(products, prefix)
+    paginated_cards(products, prefix, LIST_PAGE_SIZE)
 
 
 def rejected_page(snapshot) -> None:
@@ -344,7 +358,7 @@ def rejected_page(snapshot) -> None:
         st.dataframe(snapshot.re_evaluation_queue, width="stretch", hide_index=True)
     keyword = st.text_input("搜索 · Search", key="rejected-search")
     products = filter_products(snapshot.products, ProductFilters(keyword=keyword, rejected_only=True))
-    paginated_cards(products, "rejected")
+    paginated_cards(products, "rejected", LIST_PAGE_SIZE)
 
 
 snapshot = dashboard_snapshot()
@@ -360,6 +374,7 @@ selected_page = st.radio(
     "页面导航 · Navigation",
     NAVIGATION_TABS,
     horizontal=True,
+    index=1,
     label_visibility="collapsed",
 )
 if selected_page == NAVIGATION_TABS[0]:

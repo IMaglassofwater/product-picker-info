@@ -122,8 +122,11 @@ def test_streamlit_bootstraps_secret_before_dashboard_and_shows_safe_status():
     assert "DATABASE_SETTINGS.database_url" not in app
     assert "st.tabs" not in app
     assert "selected_page = st.radio" in app
+    assert "LIST_PAGE_SIZE = 20" in app
+    assert "index=1" in app
     assert "All Products Query" in app
     assert "Page Records" in app
+    assert "Product card render failed" in app
 
 
 def test_feedback_actions_use_shared_database_backend():
