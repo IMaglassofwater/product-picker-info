@@ -6,6 +6,12 @@ import math
 
 import streamlit as st
 
+from database_backend import configure_database_environment
+
+# Streamlit Community Cloud stores app secrets in st.secrets. Resolve that
+# value before importing dashboard_data/db, whose backend is process-scoped.
+configure_database_environment(st.secrets)
+
 from bilingual_display import (
     bilingual_content,
     bilingual_status,
@@ -26,6 +32,7 @@ from dashboard_data import (
 )
 from daily_ranker import load_current_opportunities, select_daily_top, select_full_qualified
 from product_display import build_product_display, chinese_ai_content
+import db
 
 
 st.set_page_config(page_title="Product Picker", page_icon="🧭", layout="wide")
@@ -336,6 +343,13 @@ def rejected_page(snapshot) -> None:
 
 snapshot = dashboard_snapshot()
 st.title("Product Picker")
+database_columns = st.columns(3)
+database_columns[0].metric(
+    "数据库 / Database",
+    "PostgreSQL" if db.DATABASE_SETTINGS.backend == "postgresql" else "SQLite",
+)
+database_columns[1].metric("连接状态 / Connection", "Connected")
+database_columns[2].metric("产品记录 / Products", len(snapshot.products))
 tabs = st.tabs(NAVIGATION_TABS)
 with tabs[0]:
     today_page(snapshot)

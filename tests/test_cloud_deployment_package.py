@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import db
-from database_backend import get_database_settings
+from database_backend import configure_database_environment, get_database_settings
 from postgres_backend import POSTGRES_SCHEMA, PostgresConnectionAdapter, _translate_sql
 from scripts.cloud_smoke_test import run_smoke
 from scripts.migrate_sqlite_to_postgres import inspect_production_selection
@@ -27,6 +27,30 @@ def test_postgres_database_url_selects_postgres_backend_without_exposing_url():
     assert settings.backend == "postgresql"
     assert settings.sqlite_path is None
     assert "database_url" not in repr(settings)
+
+
+def test_environment_database_url_has_priority_over_streamlit_secret():
+    environment = {"DATABASE_URL": "postgresql://environment/database"}
+    settings = configure_database_environment(
+        {"DATABASE_URL": "postgresql://streamlit/database"}, environment
+    )
+    assert settings.backend == "postgresql"
+    assert settings.database_url == "postgresql://environment/database"
+
+
+def test_streamlit_secret_selects_postgres_when_environment_is_missing():
+    environment = {}
+    settings = configure_database_environment(
+        {"DATABASE_URL": "postgresql://streamlit/database"}, environment
+    )
+    assert settings.backend == "postgresql"
+    assert environment["DATABASE_URL"] == "postgresql://streamlit/database"
+
+
+def test_missing_environment_and_streamlit_secret_use_sqlite():
+    settings = configure_database_environment({}, {})
+    assert settings.backend == "sqlite"
+    assert settings.sqlite_path is not None
 
 
 def test_postgres_adapter_translates_placeholders_and_insert_ignore():
@@ -87,3 +111,18 @@ def test_web_and_worker_entries_remain_separate():
     assert "run_pipeline" not in app
     assert "streamlit" not in worker.casefold()
     assert 'if db.DATABASE_SETTINGS.backend == "sqlite"' in (ROOT / "dashboard_data.py").read_text(encoding="utf-8")
+
+
+def test_streamlit_bootstraps_secret_before_dashboard_and_shows_safe_status():
+    app = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert app.index("configure_database_environment(st.secrets)") < app.index("from dashboard_data import")
+    assert "数据库 / Database" in app
+    assert "连接状态 / Connection" in app
+    assert "产品记录 / Products" in app
+    assert "DATABASE_SETTINGS.database_url" not in app
+
+
+def test_feedback_actions_use_shared_database_backend():
+    dashboard = (ROOT / "dashboard_data.py").read_text(encoding="utf-8")
+    assert 'db.save_user_feedback("product"' in dashboard
+    assert "sqlite3.connect" not in dashboard
