@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
+from time import perf_counter
 from typing import Callable
 
 import config
@@ -14,6 +15,7 @@ from ai_filter import run_triage_batch
 from ai_providers import BaseAIProvider, create_provider
 from daily_ranker import OpportunityInput, load_current_opportunities, select_daily_top, to_triage_candidate
 from main import run_pipeline
+from performance_timing import query_profile, timed_stage, timing_line
 
 
 LOCK_PATH = Path(__file__).resolve().parent / "data" / "daily_pipeline.lock"
@@ -94,23 +96,31 @@ def run_daily_triage(
     *, new_candidate_ids: set[str] | None = None,
     limit: int | None = None,
     provider: BaseAIProvider | None = None,
+    opportunities: list[OpportunityInput] | None = None,
+    output: Callable[[str], None] = print,
 ) -> DailyAIResult:
     """Process new candidates first, then re-evaluations and historical backlog."""
     budget = max(1, limit or config.MAX_DAILY_TRIAGE_CALLS)
     result = DailyAIResult(limit=budget)
-    opportunities = load_current_opportunities()
+    if opportunities is None:
+        with query_profile(output, "candidate_loading"):
+            opportunities = load_current_opportunities()
     new_ids = new_candidate_ids or set()
-    re_evaluations = _re_evaluation_candidates(opportunities)
-    commodity = db.get_candidate_commodity()
-    eligible = [
-        item for item in opportunities
-        if item.candidate_type != "consumer_trend"
-        or commodity.get(item.candidate_id, ("", 0))[0] == "PROMISING"
-    ]
-    missing = [
-        item for item in eligible
-        if not db.has_triage_result(item.candidate_id, "gemini", config.GEMINI_TRIAGE_MODEL)
-    ]
+    with query_profile(output, "backlog_selection"):
+        re_evaluations = _re_evaluation_candidates(opportunities)
+        commodity = db.get_candidate_commodity()
+        existing_triage_ids = db.get_triage_candidate_ids(
+            "gemini", config.GEMINI_TRIAGE_MODEL,
+        )
+        eligible = [
+            item for item in opportunities
+            if item.candidate_type != "consumer_trend"
+            or commodity.get(item.candidate_id, ("", 0))[0] == "PROMISING"
+        ]
+        missing = [
+            item for item in eligible
+            if item.candidate_id not in existing_triage_ids
+        ]
     result.skipped_existing = len(eligible) - len(missing)
     if provider is None:
         if not config.is_gemini_configured():
@@ -144,34 +154,46 @@ def run_daily_triage(
     )
 
     calls_before = getattr(provider, "api_calls_sent", 0)
-    for group_name, group, force in (
-        ("new", new_group, False),
-        ("re_evaluate", re_evaluate_group, True),
-        ("backlog", backlog_group, False),
-    ):
-        for item in group:
+    with timed_stage(output, "gemini_total"):
+        for group_name, group, force in (
+            ("new", new_group, False),
+            ("re_evaluate", re_evaluate_group, True),
+            ("backlog", backlog_group, False),
+        ):
+            for item in group:
+                if result.selected >= budget:
+                    break
+                result.selected += 1
+                result.new_selected += int(group_name == "new")
+                result.backlog_selected += int(group_name == "backlog")
+
+                def save_timed(triage_result, force_reanalyze=False):
+                    with query_profile(output, "triage_save"):
+                        return db.save_triage_result(
+                            triage_result, force_reanalyze=force_reanalyze,
+                        )
+
+                with timed_stage(
+                    output, "gemini_call", candidate_id=item.candidate_id,
+                ):
+                    batch = run_triage_batch(
+                        [to_triage_candidate(item)], products=products, commodity=commodity,
+                        provider=provider, has_result=db.has_triage_result,
+                        save_result=save_timed, force_reanalyze=force,
+                    )
+                if batch.processed:
+                    triage = batch.processed[0]
+                    existing_triage_ids.add(item.candidate_id)
+                    result.successful += 1
+                    result.statuses[triage.triage_status] += 1
+                    if force:
+                        request_id = re_evaluations.get(item.candidate_id)
+                        result.re_evaluated += int(bool(request_id and db.complete_re_evaluation(request_id)))
+                else:
+                    result.failed += 1
+                    result.errors.append(f"{item.candidate_id}: Gemini triage failed")
             if result.selected >= budget:
                 break
-            result.selected += 1
-            result.new_selected += int(group_name == "new")
-            result.backlog_selected += int(group_name == "backlog")
-            batch = run_triage_batch(
-                [to_triage_candidate(item)], products=products, commodity=commodity,
-                provider=provider, has_result=db.has_triage_result,
-                save_result=db.save_triage_result, force_reanalyze=force,
-            )
-            if batch.processed:
-                triage = batch.processed[0]
-                result.successful += 1
-                result.statuses[triage.triage_status] += 1
-                if force:
-                    request_id = re_evaluations.get(item.candidate_id)
-                    result.re_evaluated += int(bool(request_id and db.complete_re_evaluation(request_id)))
-            else:
-                result.failed += 1
-                result.errors.append(f"{item.candidate_id}: Gemini triage failed")
-        if result.selected >= budget:
-            break
 
     result.calls = max(0, getattr(provider, "api_calls_sent", 0) - calls_before)
     usage = getattr(provider, "usage", {})
@@ -179,7 +201,7 @@ def run_daily_triage(
     result.output_tokens = int(usage.get("output_tokens", 0) or 0)
     result.total_tokens = int(usage.get("total_tokens", 0) or 0)
     result.pending = sum(
-        not db.has_triage_result(item.candidate_id, "gemini", config.GEMINI_TRIAGE_MODEL)
+        item.candidate_id not in existing_triage_ids
         for item in eligible
     )
     return result
@@ -197,30 +219,43 @@ def execute_daily(
     *, pipeline_step: Callable[[str], bool] | None = None,
     ai_step: Callable[[], int | DailyAIResult] | None = None,
     lock_path: Path = LOCK_PATH,
+    output: Callable[[str], None] = print,
 ) -> DailyRunResult:
     """Run ingestion, bounded AI backlog coverage, and optional-deep ranking."""
+    pipeline_started = perf_counter()
     lock = PipelineLock(lock_path)
     if not lock.acquire():
         return DailyRunResult("", "FAILED", 0, "pipeline already running")
     run_id = ""
     try:
-        if not db.init_db():
-            return DailyRunResult("", "FAILED", 0, "database initialization failed")
-        before_products = len(db.get_all_product_urls())
-        before_opportunities = {item.candidate_id for item in load_current_opportunities()}
+        with query_profile(output, "database_init"):
+            if not db.init_db():
+                return DailyRunResult("", "FAILED", 0, "database initialization failed")
+        with query_profile(output, "candidate_loading_before"):
+            before_products = len(db.get_all_product_urls())
+            before_opportunities = {item.candidate_id for item in load_current_opportunities()}
         run_id = db.start_pipeline_run()
-        step = pipeline_step or (lambda current_id: run_pipeline(run_id=current_id, finish_run=False))
-        if not step(run_id):
+        step = pipeline_step or (lambda current_id: run_pipeline(
+            run_id=current_id, finish_run=False, output=output,
+        ))
+        with timed_stage(output, "source_ingestion_total"):
+            pipeline_ok = step(run_id)
+        if not pipeline_ok:
             db.finish_pipeline_run(run_id, "FAILED", "database or pipeline write failed")
             return DailyRunResult(run_id, "FAILED", 0, "database or pipeline write failed")
 
-        opportunities = load_current_opportunities()
+        with query_profile(output, "candidate_loading_after_ingestion"):
+            opportunities = load_current_opportunities()
         new_candidate_ids = {
             item.candidate_id for item in opportunities if item.candidate_id not in before_opportunities
         }
         source_rows, source_failures = _source_summary(run_id)
         try:
-            ai_value = ai_step() if ai_step else run_daily_triage(new_candidate_ids=new_candidate_ids)
+            ai_value = ai_step() if ai_step else run_daily_triage(
+                new_candidate_ids=new_candidate_ids,
+                opportunities=opportunities,
+                output=output,
+            )
             ai = ai_value if isinstance(ai_value, DailyAIResult) else DailyAIResult(
                 config.MAX_DAILY_TRIAGE_CALLS, pending=int(ai_value)
             )
@@ -232,7 +267,12 @@ def execute_daily(
             )
             ai.errors.append(f"Gemini unavailable ({type(exc).__name__})")
 
-        ranking = select_daily_top(load_current_opportunities(), require_physical_analysis=False)
+        with query_profile(output, "opportunity_loading_post_gemini"):
+            ranking_opportunities = load_current_opportunities()
+        with timed_stage(output, "ranking"):
+            ranking = select_daily_top(
+                ranking_opportunities, require_physical_analysis=False,
+            )
         stats = {
             "products_before": before_products,
             "products_after": len(db.get_all_product_urls()),
@@ -252,10 +292,14 @@ def execute_daily(
             errors.append("Gemini unavailable for some candidates; AI remains PENDING")
         status = "PARTIAL" if errors else "SUCCESS"
         error = "; ".join(errors)
-        db.finish_pipeline_run(run_id, status, error, stats=stats)
+        with query_profile(output, "pipeline_run_finalization"):
+            db.finish_pipeline_run(run_id, status, error, stats=stats)
         return DailyRunResult(run_id, status, ai.pending, error, stats)
     finally:
         lock.release()
+        output(timing_line(
+            stage="pipeline_total", duration_s=perf_counter() - pipeline_started,
+        ))
 
 
 def main() -> int:

@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from time import perf_counter
 from datetime import datetime, timezone
 from uuid import uuid4
 from pathlib import Path
@@ -17,6 +18,7 @@ from rule_filter import FilterResult
 from software_analysis import SoftwareAnalysisResult
 from opportunity_specificity import SpecificityResult
 from database_backend import DEFAULT_SQLITE_PATH, get_database_settings
+from performance_timing import timing_line
 
 
 DATABASE_SETTINGS = get_database_settings()
@@ -395,6 +397,7 @@ def save_products(
     demand_signal_results: dict[str, DemandSignalResult] | None = None,
     demand_opportunity_results: dict[str, DemandOpportunityResult] | None = None,
     commodity_results: dict[str, CommodityResult] | None = None,
+    timing_output=None,
 ) -> tuple[int, int]:
     """Save products in one transaction and count URL duplicates.
 
@@ -407,6 +410,8 @@ def save_products(
 
     saved_count = 0
     duplicate_count = 0
+    snapshot_duration = 0.0
+    snapshot_writes = 0
     try:
         with _connect() as connection:
             for product in products:
@@ -617,10 +622,17 @@ def save_products(
                             ),
                         )
                 if product_id is not None:
-                    _save_metric_snapshot_if_changed(
+                    snapshot_started = perf_counter()
+                    snapshot_writes += int(_save_metric_snapshot_if_changed(
                         connection, product_id, product.source_platform,
                         product.raw_data, now,
-                    )
+                    ))
+                    snapshot_duration += perf_counter() - snapshot_started
+        if timing_output is not None:
+            timing_output(timing_line(
+                stage="snapshot_writes", duration_s=snapshot_duration,
+                writes=snapshot_writes,
+            ))
         return saved_count, duplicate_count
     except (AttributeError, TypeError, ValueError, sqlite3.Error):
         return 0, 0
@@ -873,6 +885,39 @@ def save_specificity_result(
         return False
 
 
+def save_specificity_results(
+    results: list[tuple[str, SpecificityResult]], *, rule_version: str = "v1",
+) -> int:
+    """Save one run's specificity results in a single transaction."""
+    if not results:
+        return 0
+    saved = 0
+    try:
+        with _connect() as connection:
+            evaluated_at = _utc_now()
+            for candidate_id, result in results:
+                cursor = connection.execute(
+                    """INSERT INTO specificity_results
+                       (candidate_id, specificity_status, specificity_score,
+                        specificity_reason, specificity_flags, rule_version, evaluated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(candidate_id, rule_version) DO UPDATE SET
+                        specificity_status=excluded.specificity_status,
+                        specificity_score=excluded.specificity_score,
+                        specificity_reason=excluded.specificity_reason,
+                        specificity_flags=excluded.specificity_flags,
+                        evaluated_at=excluded.evaluated_at""",
+                    (candidate_id, result.specificity_status, result.specificity_score,
+                     result.specificity_reason,
+                     json.dumps(result.specificity_flags, ensure_ascii=False),
+                     rule_version, evaluated_at),
+                )
+                saved += int(cursor.rowcount == 1)
+        return saved
+    except (TypeError, ValueError, sqlite3.Error):
+        return 0
+
+
 def save_user_feedback(
     entity_type: str, entity_id: str, feedback_type: str, note: str = ""
 ) -> bool:
@@ -1040,6 +1085,22 @@ def has_triage_result(candidate_id: str, provider: str, model: str) -> bool:
             ).fetchone() is not None
     except sqlite3.Error:
         return False
+
+
+def get_triage_candidate_ids(provider: str, model: str) -> set[str]:
+    """Load provider/model coverage in one query to avoid per-candidate checks."""
+    try:
+        if not init_db():
+            return set()
+        with _connect() as connection:
+            rows = connection.execute(
+                """SELECT candidate_id FROM ai_triage_results
+                   WHERE provider = ? AND model = ?""",
+                (provider, model),
+            ).fetchall()
+        return {row["candidate_id"] for row in rows}
+    except sqlite3.Error:
+        return set()
 
 
 def save_triage_result(result: AITriageResult, *, force_reanalyze: bool = False) -> bool:

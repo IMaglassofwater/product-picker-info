@@ -65,6 +65,10 @@ def setup_triage(monkeypatch, opportunities, existing=None):
         db, "has_triage_result",
         lambda candidate_id, provider, model: candidate_id in stored,
     )
+    monkeypatch.setattr(
+        db, "get_triage_candidate_ids",
+        lambda provider, model: set(stored),
+    )
 
     def save(result, force_reanalyze=False):
         stored.add(result.candidate_id)

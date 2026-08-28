@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import re
+from time import perf_counter
 from typing import Any, Iterator
+
+from performance_timing import record_query
 
 
 _POOLS: dict[str, Any] = {}
@@ -27,7 +30,11 @@ class PostgresConnectionAdapter:
         self.connection = connection
 
     def execute(self, sql: str, params: tuple | list = ()):
-        return self.connection.execute(_translate_sql(sql), params)
+        started = perf_counter()
+        try:
+            return self.connection.execute(_translate_sql(sql), params)
+        finally:
+            record_query(sql, perf_counter() - started)
 
     def executescript(self, _script: str):
         raise NotImplementedError("PostgreSQL schema uses initialize_postgres_schema")

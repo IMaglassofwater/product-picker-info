@@ -25,6 +25,7 @@ from demand_signal_filter import classify_record_role, filter_demand_signal
 from feasibility_filter import filter_feasibility
 from models import Product
 from rule_filter import filter_product
+from performance_timing import query_profile, timed_stage
 from scrapers.arctic_shift import ArcticShiftScraper
 from scrapers.amazon_trends import AmazonTrendScraper, filter_amazon_trend
 from scrapers.base_scraper import BaseScraper, ScraperError
@@ -74,9 +75,10 @@ def run_pipeline(
     output("Product Picker Pipeline")
     output(SEPARATOR)
 
-    if not db.init_db():
-        output("Database initialization failed")
-        return False
+    with query_profile(output, "database_init"):
+        if not db.init_db():
+            output("Database initialization failed")
+            return False
     run_id = run_id or db.start_pipeline_run()
     existing_urls = db.get_all_product_urls()
     existing_candidate_ids = {
@@ -93,7 +95,8 @@ def run_pipeline(
         output("\nSource:")
         output(source_label)
         try:
-            source_products = scraper.fetch()
+            with timed_stage(output, "fetch", source=scraper.source_name):
+                source_products = scraper.fetch()
         except ScraperError as exc:
             output("Unavailable")
             output(f"Reason: {exc}")
@@ -119,49 +122,45 @@ def run_pipeline(
         output(f"Fetched:\n{len(source_products)}")
         output(f"Processed:\n{len(processed_products)}")
 
-    results = [filter_product(product) for product in products]
-    filter_results = {
-        product.url: result for product, result in zip(products, results)
-    }
-    role_results_list = [
-        classify_record_role(product, result.opportunity_type)
-        for product, result in zip(products, results)
-    ]
-    record_role_results = {
-        product.url: result for product, result in zip(products, role_results_list)
-    }
-    feasibility_pairs = [
-        (product, filter_feasibility(product))
-        for product, role in zip(products, role_results_list)
-        if role.record_role == "product"
-    ]
-    feasibility_results = {
-        product.url: result for product, result in feasibility_pairs
-    }
-    demand_pairs = [
-        (product, filter_demand_signal(product))
-        for product, role in zip(products, role_results_list)
-        if role.record_role == "demand_signal"
-    ]
-    demand_signal_results = {
-        product.url: result for product, result in demand_pairs
-    }
-    opportunity_pairs = [
-        (product, filter_demand_opportunity(product, demand_result))
-        for product, demand_result in demand_pairs
-        if demand_result.signal_status in {"HIGH", "MEDIUM"}
-    ]
-    demand_opportunity_results = {
-        product.url: result for product, result in opportunity_pairs
-    }
-    commodity_results = {
-        product.url: filter_commodity(product)
-        for product in products if product.source_platform == "amazon"
-    }
-    creative_results = {
-        product.url: filter_creative_content(product)
-        for product in products if product.source_platform == "yanko_design"
-    }
+    results = []
+    filter_results = {}
+    role_results_list = []
+    record_role_results = {}
+    feasibility_pairs = []
+    feasibility_results = {}
+    demand_pairs = []
+    demand_signal_results = {}
+    opportunity_pairs = []
+    demand_opportunity_results = {}
+    commodity_results = {}
+    creative_results = {}
+    for source_name, stats in source_stats.items():
+        if stats["failed"]:
+            continue
+        with timed_stage(output, "process", source=source_name):
+            for product in stats["products"]:
+                filter_result = filter_product(product)
+                results.append(filter_result)
+                filter_results[product.url] = filter_result
+                role = classify_record_role(product, filter_result.opportunity_type)
+                role_results_list.append(role)
+                record_role_results[product.url] = role
+                if role.record_role == "product":
+                    feasibility = filter_feasibility(product)
+                    feasibility_pairs.append((product, feasibility))
+                    feasibility_results[product.url] = feasibility
+                if role.record_role == "demand_signal":
+                    demand = filter_demand_signal(product)
+                    demand_pairs.append((product, demand))
+                    demand_signal_results[product.url] = demand
+                    if demand.signal_status in {"HIGH", "MEDIUM"}:
+                        opportunity = filter_demand_opportunity(product, demand)
+                        opportunity_pairs.append((product, opportunity))
+                        demand_opportunity_results[product.url] = opportunity
+                if product.source_platform == "amazon":
+                    commodity_results[product.url] = filter_commodity(product)
+                if product.source_platform == "yanko_design":
+                    creative_results[product.url] = filter_creative_content(product)
     rejected_count = sum(result.status == "rejected" for result in results)
     uncertain_status_count = sum(result.status == "uncertain" for result in results)
     opportunity_type_counts = {
@@ -259,106 +258,124 @@ def run_pipeline(
         flag: sum(flag in result.opportunity_flags for _product, result in opportunity_pairs)
         for flag in opportunity_flag_names
     }
-    saved_count, duplicate_count = db.save_products(
-        products,
-        filter_results,
-        feasibility_results,
-        record_role_results,
-        demand_signal_results,
-        demand_opportunity_results,
-        commodity_results,
-    )
-    validated_candidates = [
-        candidate
-        for product, feasibility_result in feasibility_pairs
-        for candidate in (
-            build_validated_product_candidate(
-                product,
-                feasibility_status=feasibility_result.feasibility_status,
-                feasibility_score=feasibility_result.feasibility_score,
-                positive_signals=feasibility_result.positive_signals,
-            ),
-        )
-        if candidate is not None
-    ]
-    demand_candidates = [
-        candidate
-        for product, opportunity_result in opportunity_pairs
-        for demand_result in (demand_signal_results[product.url],)
-        for candidate in (
-            build_demand_candidate(
-                product,
-                demand_opportunity_status=(
-                    opportunity_result.demand_opportunity_status
-                ),
-                demand_opportunity_score=(
-                    opportunity_result.demand_opportunity_score
-                ),
-                signal_score=demand_result.signal_score,
-                signal_type=demand_result.signal_type,
-                opportunity_flags=opportunity_result.opportunity_flags,
-            ),
-        )
-        if candidate is not None
-    ]
-    inspiration_candidates = [
-        candidate
-        for product in products if product.source_platform == "yanko_design"
-        for candidate in (build_inspiration_candidate(product, creative_results[product.url]),)
-        if candidate is not None
-    ]
-    consumer_trend_candidates = [
-        candidate
-        for product in products if product.source_platform == "amazon"
-        for trend_result in (filter_amazon_trend(product),)
-        for commodity_result in (commodity_results[product.url],)
-        for candidate in (
-            build_consumer_trend_candidate(
-                product,
-                status=trend_result.status,
-                feasibility_score=trend_result.feasibility_score,
-                market_signal_score=trend_result.market_signal_score,
-                micro_innovation_score=trend_result.micro_innovation_score,
-                signals=trend_result.signals,
-                reason=trend_result.reason,
-                commodity_status=commodity_result.commodity_status,
-            ),
-        )
-        if candidate is not None
-    ]
-    candidates = deduplicate_candidates(
-        validated_candidates + demand_candidates
-        + inspiration_candidates + consumer_trend_candidates
-    )
-    db.save_candidates(candidates)
-    from opportunity_specificity import assess_specificity
-    for candidate in candidates:
-        result = assess_specificity(
-            candidate.title, candidate.summary, candidate.signals,
-            candidate.candidate_type, candidate.source_platform,
-        )
-        db.save_specificity_result(candidate.candidate_id, result, rule_version="v1")
-
+    saved_count = 0
+    duplicate_count = 0
     for source_name, stats in source_stats.items():
         if stats["failed"]:
             continue
         source_products = stats["products"]
-        source_candidates = [
-            c for c in candidates
-            if c.source_platform == source_name
-            and c.candidate_id not in existing_candidate_ids
+        with query_profile(output, "save", source=source_name):
+            source_saved, source_duplicates = db.save_products(
+                source_products,
+                filter_results,
+                feasibility_results,
+                record_role_results,
+                demand_signal_results,
+                demand_opportunity_results,
+                commodity_results,
+                timing_output=output,
+            )
+        saved_count += source_saved
+        duplicate_count += source_duplicates
+    with timed_stage(output, "candidate_creation_update"):
+        validated_candidates = [
+            candidate
+            for product, feasibility_result in feasibility_pairs
+            for candidate in (
+                build_validated_product_candidate(
+                    product,
+                    feasibility_status=feasibility_result.feasibility_status,
+                    feasibility_score=feasibility_result.feasibility_score,
+                    positive_signals=feasibility_result.positive_signals,
+                ),
+            )
+            if candidate is not None
         ]
-        rejected = sum(
-            filter_results[p.url].status == "rejected" for p in source_products
+        demand_candidates = [
+            candidate
+            for product, opportunity_result in opportunity_pairs
+            for demand_result in (demand_signal_results[product.url],)
+            for candidate in (
+                build_demand_candidate(
+                    product,
+                    demand_opportunity_status=(
+                        opportunity_result.demand_opportunity_status
+                    ),
+                    demand_opportunity_score=(
+                        opportunity_result.demand_opportunity_score
+                    ),
+                    signal_score=demand_result.signal_score,
+                    signal_type=demand_result.signal_type,
+                    opportunity_flags=opportunity_result.opportunity_flags,
+                ),
+            )
+            if candidate is not None
+        ]
+        inspiration_candidates = [
+            candidate
+            for product in products if product.source_platform == "yanko_design"
+            for candidate in (build_inspiration_candidate(product, creative_results[product.url]),)
+            if candidate is not None
+        ]
+        consumer_trend_candidates = [
+            candidate
+            for product in products if product.source_platform == "amazon"
+            for trend_result in (filter_amazon_trend(product),)
+            for commodity_result in (commodity_results[product.url],)
+            for candidate in (
+                build_consumer_trend_candidate(
+                    product,
+                    status=trend_result.status,
+                    feasibility_score=trend_result.feasibility_score,
+                    market_signal_score=trend_result.market_signal_score,
+                    micro_innovation_score=trend_result.micro_innovation_score,
+                    signals=trend_result.signals,
+                    reason=trend_result.reason,
+                    commodity_status=commodity_result.commodity_status,
+                ),
+            )
+            if candidate is not None
+        ]
+        candidates = deduplicate_candidates(
+            validated_candidates + demand_candidates
+            + inspiration_candidates + consumer_trend_candidates
         )
-        db.record_pipeline_source_run(
-            run_id, source_name,
-            fetched=stats["fetched"],
-            new_count=sum(p.url not in existing_urls for p in source_products),
-            updated_count=sum(p.url in existing_urls for p in source_products),
-            rejected=rejected,
-            candidates_created=len(source_candidates),
-        )
+        db.save_candidates(candidates)
+    from opportunity_specificity import assess_specificity
+    with timed_stage(output, "specificity_rule_filtering"):
+        specificity_results = [
+            (
+                candidate.candidate_id,
+                assess_specificity(
+                    candidate.title, candidate.summary, candidate.signals,
+                    candidate.candidate_type, candidate.source_platform,
+                ),
+            )
+            for candidate in candidates
+        ]
+        db.save_specificity_results(specificity_results, rule_version="v1")
+
+    with query_profile(output, "candidate_status_updates"):
+        for source_name, stats in source_stats.items():
+            if stats["failed"]:
+                continue
+            source_products = stats["products"]
+            source_candidates = [
+                c for c in candidates
+                if c.source_platform == source_name
+                and c.candidate_id not in existing_candidate_ids
+            ]
+            rejected = sum(
+                filter_results[p.url].status == "rejected" for p in source_products
+            )
+            db.record_pipeline_source_run(
+                run_id, source_name,
+                fetched=stats["fetched"],
+                new_count=sum(p.url not in existing_urls for p in source_products),
+                updated_count=sum(p.url in existing_urls for p in source_products),
+                rejected=rejected,
+                candidates_created=len(source_candidates),
+            )
     if run_id and finish_run:
         db.finish_pipeline_run(
             run_id,
