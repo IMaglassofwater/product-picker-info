@@ -16,6 +16,9 @@ def test_triage_contract_requests_grounded_bilingual_content():
         assert field in TRIAGE_JSON_SCHEMA["properties"]
         assert field in TRIAGE_JSON_SCHEMA["required"]
     assert "Chinese fields must not add facts" in SYSTEM_PROMPT
+    assert TRIAGE_JSON_SCHEMA["properties"]["display_title_zh"] == {"type": "string"}
+    assert "must always be a non-empty" in SYSTEM_PROMPT
+    assert "never return null or an empty string" in SYSTEM_PROMPT
 
 
 def _candidate(index=1, kind="demand_opportunity", score=82, signals=None, summary="Clear lightweight organizer pain point"):

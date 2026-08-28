@@ -17,6 +17,9 @@ concurrency:
 
 jobs:
   daily:
+    # Scheduled runs remain defined but are paused unless the repository variable
+    # is explicitly enabled. Manual production tests continue to work.
+    if: github.event_name == 'workflow_dispatch' || vars.DAILY_SCHEDULE_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -32,7 +35,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_TRIAGE_MODEL: gemini-3.5-flash-lite
-          DAILY_SCHEDULE_ENABLED: "true"
+          DAILY_SCHEDULE_ENABLED: ${{ vars.DAILY_SCHEDULE_ENABLED || 'false' }}
           PRODUCTION_DAILY: "true"
           MAX_DAILY_TRIAGE_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_daily_triage_calls || '30' }}
         run: python run_daily.py

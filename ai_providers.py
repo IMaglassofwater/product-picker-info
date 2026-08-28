@@ -61,7 +61,7 @@ class GeminiTriageResponse(BaseModel):
     key_opportunity: str
     main_risks: list[str]
     needs_deep_analysis: bool
-    display_title_zh: str | None
+    display_title_zh: str
     primary_reason_zh: str
     key_opportunity_zh: str
     main_risks_zh: list[str]

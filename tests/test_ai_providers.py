@@ -23,6 +23,7 @@ def test_gemini_response_schema_reserves_required_chinese_fields():
     assert fields["primary_reason_zh"].is_required()
     assert fields["key_opportunity_zh"].is_required()
     assert fields["main_risks_zh"].is_required()
+    assert fields["display_title_zh"].annotation is str
 
 
 class _Responses:
@@ -130,6 +131,7 @@ def test_gemini_provider_structured_output_model_timeout_and_no_key_leak():
     assert request["config"]["response_schema"] is GeminiTriageResponse
     assert request["config"]["system_instruction"] == SYSTEM_PROMPT
     assert request["config"]["thinking_config"].thinking_level.value == "MINIMAL"
+    assert request["config"]["response_schema"].model_fields["display_title_zh"].annotation is str
     assert "secret-gemini" not in repr(request)
 
 

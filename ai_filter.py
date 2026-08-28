@@ -27,7 +27,7 @@ TRIAGE_JSON_SCHEMA = {
         "key_opportunity": {"type": "string", "maxLength": 160},
         "main_risks": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 80}},
         "needs_deep_analysis": {"type": "boolean"},
-        "display_title_zh": {"type": ["string", "null"]},
+        "display_title_zh": {"type": "string"},
         "primary_reason_zh": {"type": "string"},
         "key_opportunity_zh": {"type": "string"},
         "main_risks_zh": {"type": "array", "maxItems": 3, "items": {"type": "string"}},
@@ -37,7 +37,7 @@ SYSTEM_PROMPT = """Triage candidates for an individual or small team with under 
 
 Use only evidence in the Candidate Input and the resource constraints above. Do not invent or present as verified any supplier or 1688 availability, MOQ, manufacturing cost, material cost, OEM ease, competition level, market size or growth, customer profession/demographics, IP status, certification, regulation, or export safety. If evidence is absent, say it requires validation or that no obvious signal appears in the input. Base primary_reason mainly on input evidence. key_opportunity may state a hypothesis, but label it with could, may, potential, or worth testing. A score of 10 requires strong evidence of feasibility, demand, validation, and differentiation; when supply chain, competition, or cost is unknown, generally cap at 8-9.
 
-Return the same business judgment in concise English and natural, beginner-readable Simplified Chinese in one response. Chinese fields must not add facts, certainty, suppliers, MOQ, costs, market size, competition, customer profiles, certification, or regulation absent from the English/evidence. Keep primary_reason_zh within about 70 Chinese characters, key_opportunity_zh within about 90, and main_risks_zh to at most 3 items of about 45 characters each. display_title_zh should be a faithful concise opportunity title; return null when a reliable Chinese title cannot be formed. Return only compact JSON."""
+Return the same business judgment in concise English and natural, beginner-readable Simplified Chinese in one response. Chinese fields must not add facts, certainty, suppliers, MOQ, costs, market size, competition, customer profiles, certification, or regulation absent from the English/evidence. Keep primary_reason_zh within about 70 Chinese characters, key_opportunity_zh within about 90, and main_risks_zh to at most 3 items of about 45 characters each. display_title_zh must always be a non-empty, natural Simplified Chinese opportunity title of about 25 Chinese characters or fewer. Translate or faithfully summarize only the original title; do not add features or facts, do not use a mechanical word-by-word rendering, and never return null or an empty string. Return only compact JSON."""
 
 
 @dataclass

@@ -155,6 +155,27 @@ def test_all_sources_failed_is_degraded_not_database_failure(tmp_path, monkeypat
     assert result.status == "PARTIAL"
 
 
+def test_missing_chinese_title_does_not_make_pipeline_partial(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "daily.db")
+    ai = DailyAIResult(5, successful=1)
+    result = execute_daily(
+        pipeline_step=lambda _run_id: True,
+        ai_step=lambda: ai,
+        lock_path=tmp_path / "daily.lock",
+    )
+    assert result.status == "SUCCESS"
+
+
+def test_database_initialization_failure_is_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "init_db", lambda: False)
+    result = execute_daily(
+        pipeline_step=lambda _run_id: True,
+        ai_step=lambda: DailyAIResult(5),
+        lock_path=tmp_path / "daily.lock",
+    )
+    assert result.status == "FAILED"
+
+
 def test_not_interested_is_excluded_from_today():
     item = opportunity(1)
     item.triage = AITriageResult(
@@ -171,7 +192,8 @@ def test_production_workflow_schedule_manual_limit_and_neon_only():
     assert "workflow_dispatch:" in WORKFLOW
     assert 'default: "5"' in WORKFLOW
     assert "MAX_DAILY_TRIAGE_CALLS:" in WORKFLOW and "'30'" in WORKFLOW
-    assert 'DAILY_SCHEDULE_ENABLED: "true"' in WORKFLOW
+    assert "if: github.event_name == 'workflow_dispatch' || vars.DAILY_SCHEDULE_ENABLED == 'true'" in WORKFLOW
+    assert "DAILY_SCHEDULE_ENABLED: ${{ vars.DAILY_SCHEDULE_ENABLED || 'false' }}" in WORKFLOW
     assert 'PRODUCTION_DAILY: "true"' in WORKFLOW
     assert "secrets.DATABASE_URL" in WORKFLOW
     assert "product_picker.db" not in WORKFLOW and "D:\\" not in WORKFLOW
