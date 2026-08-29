@@ -200,5 +200,9 @@ def test_production_workflow_schedule_manual_limit_and_neon_only():
     assert "DAILY_SCHEDULE_ENABLED: ${{ vars.DAILY_SCHEDULE_ENABLED || 'false' }}" in WORKFLOW
     assert 'PRODUCTION_DAILY: "true"' in WORKFLOW
     assert "secrets.DATABASE_URL" in WORKFLOW
+    assert "secrets.WXPUSHER_APP_TOKEN" in WORKFLOW
+    assert "secrets.WXPUSHER_UID" in WORKFLOW
+    assert "notification_test_only:" in WORKFLOW
+    assert "python -m wxpusher_notifier --test" in WORKFLOW
     assert "product_picker.db" not in WORKFLOW and "D:\\" not in WORKFLOW
     assert "stats_json JSONB" in (Path(__file__).parents[1] / "postgres_backend.py").read_text(encoding="utf-8")

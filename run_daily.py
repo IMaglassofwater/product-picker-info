@@ -13,9 +13,15 @@ import config
 import db
 from ai_filter import run_triage_batch
 from ai_providers import BaseAIProvider, create_provider
-from daily_ranker import OpportunityInput, load_current_opportunities, select_daily_top, to_triage_candidate
+from daily_ranker import (
+    OpportunityInput, load_current_opportunities, select_daily_top,
+    select_full_qualified, to_triage_candidate,
+)
 from main import run_pipeline
 from performance_timing import query_profile, timed_stage, timing_line
+from wxpusher_notifier import (
+    DailyNotificationSummary, NotificationTopPick, send_daily_notification,
+)
 
 
 LOCK_PATH = Path(__file__).resolve().parent / "data" / "daily_pipeline.lock"
@@ -273,6 +279,7 @@ def execute_daily(
             ranking = select_daily_top(
                 ranking_opportunities, require_physical_analysis=False,
             )
+            qualified = select_full_qualified(ranking_opportunities)
         stats = {
             "products_before": before_products,
             "products_after": len(db.get_all_product_urls()),
@@ -283,6 +290,25 @@ def execute_daily(
                 key: value for key, value in asdict(ai).items() if key not in {"statuses", "errors"}
             } | {"statuses": dict(ai.statuses), "errors": ai.errors[:10]},
             "ranking_count": len(ranking.final),
+            "qualified_count": len(qualified),
+            "top_picks": [
+                {
+                    "title": (
+                        item.candidate.triage.display_title_zh
+                        if item.candidate.triage and item.candidate.triage.display_title_zh
+                        else item.candidate.display_title
+                    ),
+                    "score": item.final_rank_score,
+                    "reason": (
+                        item.candidate.triage.primary_reason_zh
+                        if item.candidate.triage and item.candidate.triage.primary_reason_zh
+                        else item.candidate.triage.primary_reason
+                        if item.candidate.triage
+                        else item.selection_reason
+                    ),
+                }
+                for item in ranking.final[:3]
+            ],
             "sources": source_rows,
         }
         errors = []
@@ -304,10 +330,48 @@ def execute_daily(
 
 def main() -> int:
     if os.getenv("PRODUCTION_DAILY", "").casefold() == "true" and db.DATABASE_SETTINGS.backend != "postgresql":
-        print("Daily Product Picker: FAILED")
-        print("Production daily runner requires PostgreSQL DATABASE_URL")
-        return 1
-    result = execute_daily()
+        result = DailyRunResult(
+            "", "FAILED", 0, "Production daily runner requires PostgreSQL DATABASE_URL",
+        )
+    else:
+        try:
+            result = execute_daily()
+        except Exception as exc:
+            result = DailyRunResult(
+                "", "FAILED", 0, f"Unexpected {type(exc).__name__}",
+            )
+    source_failures = [
+        (str(row.get("source_platform", "unknown")), str(row.get("error", "unavailable")))
+        for row in result.stats.get("sources", []) if row.get("failed")
+    ]
+    triage = result.stats.get("triage", {})
+    top_picks = [
+        NotificationTopPick(
+            str(item.get("title", "Untitled")), int(item.get("score", 0)),
+            str(item.get("reason", "")),
+        )
+        for item in result.stats.get("top_picks", [])[:3]
+    ]
+    run_url = ""
+    if os.getenv("GITHUB_SERVER_URL") and os.getenv("GITHUB_REPOSITORY") and os.getenv("GITHUB_RUN_ID"):
+        run_url = (
+            f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+            f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+        )
+    try:
+        send_daily_notification(DailyNotificationSummary(
+            status=result.status,
+            new_products=int(result.stats.get("new_products", 0)),
+            ai_analyzed=int(triage.get("successful", 0)),
+            qualified=int(result.stats.get("qualified_count", 0)),
+            top_picks=top_picks,
+            failed_sources=source_failures,
+            failed_stage="Daily Pipeline" if result.status == "FAILED" else "",
+            error=result.error,
+            run_url=run_url,
+        ))
+    except Exception as exc:
+        print(f"WARNING: WxPusher notification failed ({type(exc).__name__})")
     print(f"Daily Product Picker: {result.status}")
     print(f"AI Pending: {result.ai_pending}")
     if result.error:

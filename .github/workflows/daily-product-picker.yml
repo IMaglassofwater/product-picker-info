@@ -7,6 +7,11 @@ on:
         description: "Gemini Cheap Triage call limit for this manual run"
         required: false
         default: "5"
+      notification_test_only:
+        description: "Send only the WxPusher connectivity test (no scraping or Gemini)"
+        required: false
+        type: boolean
+        default: false
   schedule:
     # 23:00 UTC is 08:00 JST on the following calendar day.
     - cron: "0 23 * * *"
@@ -30,7 +35,14 @@ jobs:
           cache: pip
       - name: Install runtime dependencies
         run: pip install -r requirements.txt
+      - name: Test WxPusher notification only
+        if: github.event_name == 'workflow_dispatch' && inputs.notification_test_only == true
+        env:
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+        run: python -m wxpusher_notifier --test
       - name: Run daily pipeline
+        if: github.event_name == 'schedule' || inputs.notification_test_only != true
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -38,4 +50,6 @@ jobs:
           DAILY_SCHEDULE_ENABLED: ${{ vars.DAILY_SCHEDULE_ENABLED || 'false' }}
           PRODUCTION_DAILY: "true"
           MAX_DAILY_TRIAGE_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_daily_triage_calls || '30' }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
         run: python run_daily.py
