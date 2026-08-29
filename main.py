@@ -274,7 +274,18 @@ def run_pipeline(
                 demand_opportunity_results,
                 commodity_results,
                 timing_output=output,
+                initialize=False,
             )
+        if source_products and source_saved == 0 and source_duplicates == 0:
+            stats["failed"] = True
+            stats["error"] = "Database persistence failed"
+            output("Database persistence failed")
+            if run_id:
+                db.record_pipeline_source_run(
+                    run_id, source_name, fetched=stats["fetched"],
+                    failed=True, error=stats["error"],
+                )
+            continue
         saved_count += source_saved
         duplicate_count += source_duplicates
     with timed_stage(output, "candidate_creation_update"):

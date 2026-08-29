@@ -23,6 +23,7 @@ from performance_timing import timing_line
 
 DATABASE_SETTINGS = get_database_settings()
 DB_PATH = DATABASE_SETTINGS.sqlite_path or DEFAULT_SQLITE_PATH
+_INITIALIZED_POSTGRES_DATABASES: set[str] = set()
 
 
 def _decode_json(value, default):
@@ -49,8 +50,12 @@ def init_db() -> bool:
     """Create the database directory and required tables."""
     try:
         if DATABASE_SETTINGS.backend == "postgresql":
+            database_url = DATABASE_SETTINGS.database_url
+            if database_url in _INITIALIZED_POSTGRES_DATABASES:
+                return True
             from postgres_backend import initialize_postgres_schema
-            initialize_postgres_schema(DATABASE_SETTINGS.database_url)
+            initialize_postgres_schema(database_url)
+            _INITIALIZED_POSTGRES_DATABASES.add(database_url)
             return True
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _connect() as connection:
@@ -398,6 +403,7 @@ def save_products(
     demand_opportunity_results: dict[str, DemandOpportunityResult] | None = None,
     commodity_results: dict[str, CommodityResult] | None = None,
     timing_output=None,
+    initialize: bool = True,
 ) -> tuple[int, int]:
     """Save products in one transaction and count URL duplicates.
 
@@ -405,8 +411,15 @@ def save_products(
         A ``(saved_count, duplicate_count)`` tuple. Database or serialization
         errors are contained and reported as zero saved and zero duplicates.
     """
-    if not init_db():
+    if initialize and not init_db():
         return 0, 0
+
+    if DATABASE_SETTINGS.backend == "postgresql":
+        return _save_products_postgres_batch(
+            products, filter_results, feasibility_results, record_role_results,
+            demand_signal_results, demand_opportunity_results, commodity_results,
+            timing_output,
+        )
 
     saved_count = 0
     duplicate_count = 0
@@ -635,6 +648,74 @@ def save_products(
             ))
         return saved_count, duplicate_count
     except (AttributeError, TypeError, ValueError, sqlite3.Error):
+        return 0, 0
+
+
+def _save_products_postgres_batch(
+    products, filter_results, feasibility_results, record_role_results,
+    demand_signal_results, demand_opportunity_results, commodity_results,
+    timing_output,
+) -> tuple[int, int]:
+    """Prepare and persist one PostgreSQL source batch without per-row queries."""
+    from postgres_backend import persist_product_batch
+
+    rows = []
+    for product in products:
+        now = _utc_now()
+        filter_result = (filter_results or {}).get(product.url)
+        role_result = (record_role_results or {}).get(product.url)
+        feasibility = (feasibility_results or {}).get(product.url)
+        demand = (demand_signal_results or {}).get(product.url)
+        opportunity = (demand_opportunity_results or {}).get(product.url)
+        commodity = (commodity_results or {}).get(product.url)
+        values = (
+            product.project_id, product.source_platform, product.url, product.title,
+            product.description, product.category, product.image_url,
+            json.dumps(product.raw_data, ensure_ascii=False),
+            filter_result.filter_score if filter_result else 0,
+            filter_result.status if filter_result else "",
+            filter_result.reason if filter_result else "",
+            filter_result.opportunity_type if filter_result else "uncertain",
+            feasibility.feasibility_status if feasibility else "",
+            feasibility.feasibility_score if feasibility else 0,
+            feasibility.feasibility_reason if feasibility else "",
+            json.dumps(feasibility.risk_flags if feasibility else []),
+            json.dumps(feasibility.positive_signals if feasibility else []),
+            role_result.record_role if role_result else "uncertain",
+            demand.signal_status if demand else "",
+            demand.signal_score if demand else 0,
+            demand.signal_type if demand else "",
+            demand.reason if demand else "",
+            opportunity.demand_opportunity_status if opportunity else "",
+            opportunity.demand_opportunity_score if opportunity else 0,
+            opportunity.demand_opportunity_reason if opportunity else "",
+            json.dumps(opportunity.opportunity_flags if opportunity else []),
+            commodity.commodity_status if commodity else "",
+            commodity.commodity_score if commodity else 0,
+            commodity.commodity_reason if commodity else "",
+            json.dumps(commodity.commodity_flags if commodity else []),
+            now, now, now,
+        )
+        rows.append({
+            "url": product.url, "values": values,
+            "source_platform": product.source_platform, "captured_at": now,
+            "metrics": _metric_payload(product.source_platform, product.raw_data),
+        })
+    try:
+        with _connect() as connection:
+            saved, duplicates, snapshot_writes, snapshot_duration = (
+                persist_product_batch(connection, rows)
+            )
+        if timing_output is not None:
+            timing_output(timing_line(
+                stage="snapshot_writes", duration_s=snapshot_duration,
+                writes=snapshot_writes,
+                batched="true",
+            ))
+        return saved, duplicates
+    except Exception:
+        # The connection context rolls back the complete source batch. This
+        # boundary contains driver errors so other sources can continue.
         return 0, 0
 
 
@@ -994,6 +1075,8 @@ def save_candidates(
     """Insert candidates without duplicating candidate IDs or source URLs."""
     if not init_db():
         return 0, 0
+    if DATABASE_SETTINGS.backend == "postgresql":
+        return _save_candidates_postgres_batch(candidates)
     saved_count = 0
     duplicate_count = 0
     try:
@@ -1031,6 +1114,45 @@ def save_candidates(
                     duplicate_count += 1
         return saved_count, duplicate_count
     except (AttributeError, TypeError, ValueError, sqlite3.Error):
+        return 0, 0
+
+
+def _save_candidates_postgres_batch(
+    candidates: list[MicroInnovationCandidate],
+) -> tuple[int, int]:
+    """Insert a candidate set with one PostgreSQL round trip."""
+    if not candidates:
+        return 0, 0
+    columns = (
+        "candidate_id", "candidate_type", "source_platform", "source_url",
+        "title", "summary", "candidate_score", "feasibility_score",
+        "demand_score", "market_validation_score", "micro_innovation_score",
+        "reason", "signals", "raw_reference_id",
+    )
+    group = "(" + ",".join(["%s"] * len(columns)) + ")"
+    values = []
+    for candidate in candidates:
+        values.extend((
+            candidate.candidate_id, candidate.candidate_type,
+            candidate.source_platform, candidate.source_url, candidate.title,
+            candidate.summary, candidate.candidate_score,
+            candidate.feasibility_score, candidate.demand_score,
+            candidate.market_validation_score,
+            candidate.micro_innovation_score, candidate.reason,
+            json.dumps(candidate.signals, ensure_ascii=False),
+            candidate.raw_reference_id,
+        ))
+    try:
+        with _connect() as connection:
+            cursor = connection.execute(
+                f"""INSERT INTO micro_innovation_candidates ({','.join(columns)})
+                    VALUES {','.join([group] * len(candidates))}
+                    ON CONFLICT DO NOTHING""",
+                tuple(values),
+            )
+        saved_count = max(cursor.rowcount, 0)
+        return saved_count, len(candidates) - saved_count
+    except Exception:
         return 0, 0
 
 

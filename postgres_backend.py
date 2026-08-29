@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 import re
 from time import perf_counter
 from typing import Any, Iterator
@@ -70,6 +71,95 @@ def initialize_postgres_schema(database_url: str) -> None:
         for statement in POSTGRES_SCHEMA.split(";"):
             if statement.strip():
                 connection.execute(statement)
+
+
+PRODUCT_BATCH_COLUMNS = (
+    "project_id", "source_platform", "url", "title", "description",
+    "category", "image_url", "raw_data", "filter_score", "filter_status",
+    "filter_reason", "opportunity_type", "feasibility_status",
+    "feasibility_score", "feasibility_reason", "risk_flags",
+    "positive_signals", "record_role", "demand_signal_status",
+    "demand_signal_score", "demand_signal_type", "demand_signal_reason",
+    "demand_opportunity_status", "demand_opportunity_score",
+    "demand_opportunity_reason", "opportunity_flags", "commodity_status",
+    "commodity_score", "commodity_reason", "commodity_flags",
+    "first_seen_at", "last_seen_at", "updated_at",
+)
+
+
+def persist_product_batch(connection: PostgresConnectionAdapter, rows: list[dict]) -> tuple[int, int, int, float]:
+    """Upsert one source batch and append changed metric snapshots."""
+    if not rows:
+        return 0, 0, 0, 0.0
+    by_url: dict[str, dict] = {}
+    duplicate_inputs = 0
+    for row in rows:
+        duplicate_inputs += int(row["url"] in by_url)
+        by_url[row["url"]] = row
+    batch = list(by_url.values())
+    urls = list(by_url)
+    existing_rows = connection.execute(
+        "SELECT id, url FROM products WHERE url = ANY(%s)", (urls,),
+    ).fetchall()
+    existing_urls = {row["url"] for row in existing_rows}
+
+    value_group = "(" + ",".join(["%s"] * len(PRODUCT_BATCH_COLUMNS)) + ")"
+    values_sql = ",".join([value_group] * len(batch))
+    update_columns = [
+        name for name in PRODUCT_BATCH_COLUMNS
+        if name not in {"url", "first_seen_at"}
+    ]
+    update_sql = ",".join(f"{name}=excluded.{name}" for name in update_columns)
+    params = tuple(value for row in batch for value in row["values"])
+    returned = connection.execute(
+        f"""INSERT INTO products ({','.join(PRODUCT_BATCH_COLUMNS)})
+            VALUES {values_sql}
+            ON CONFLICT(url) DO UPDATE SET {update_sql}
+            RETURNING id, url""",
+        params,
+    ).fetchall()
+    ids = {row["url"]: row["id"] for row in returned}
+
+    metric_rows = [row for row in batch if row["metrics"] and row["url"] in ids]
+    snapshot_started = perf_counter()
+    latest = {}
+    if metric_rows:
+        product_ids = [ids[row["url"]] for row in metric_rows]
+        latest_rows = connection.execute(
+            """SELECT DISTINCT ON (product_id) product_id, metric_data
+               FROM product_metric_snapshots
+               WHERE product_id = ANY(%s) AND metric_type = 'source_metrics'
+               ORDER BY product_id, id DESC""",
+            (product_ids,),
+        ).fetchall()
+        latest = {row["product_id"]: row["metric_data"] for row in latest_rows}
+
+    snapshots = []
+    for row in metric_rows:
+        product_id = ids[row["url"]]
+        metrics = row["metrics"]
+        previous = latest.get(product_id)
+        if isinstance(previous, str):
+            try:
+                previous = json.loads(previous)
+            except json.JSONDecodeError:
+                pass
+        if previous != metrics:
+            snapshots.append((
+                product_id, row["source_platform"], row["captured_at"],
+                json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+            ))
+    if snapshots:
+        snapshot_group = "(%s,%s,%s,'source_metrics',%s)"
+        connection.execute(
+            """INSERT INTO product_metric_snapshots
+               (product_id, source_platform, captured_at, metric_type, metric_data)
+               VALUES """ + ",".join([snapshot_group] * len(snapshots)),
+            tuple(value for snapshot in snapshots for value in snapshot),
+        )
+    saved = sum(row["url"] not in existing_urls for row in batch)
+    duplicates = len(batch) - saved + duplicate_inputs
+    return saved, duplicates, len(snapshots), perf_counter() - snapshot_started
 
 
 POSTGRES_SCHEMA = """
