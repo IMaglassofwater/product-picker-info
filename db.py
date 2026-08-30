@@ -246,6 +246,98 @@ def init_db() -> bool:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS product_eligibility (
+                    product_id INTEGER PRIMARY KEY,
+                    content_type TEXT NOT NULL,
+                    eligibility_status TEXT NOT NULL,
+                    eligibility_reason TEXT NOT NULL,
+                    eligibility_version TEXT NOT NULL,
+                    concrete_product_status TEXT NOT NULL DEFAULT 'AMBIGUOUS',
+                    concrete_product_reason TEXT NOT NULL DEFAULT '',
+                    concrete_product_version TEXT NOT NULL DEFAULT 'concrete-v1',
+                    evaluated_at TEXT NOT NULL,
+                    FOREIGN KEY(product_id) REFERENCES products(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS product_identities (
+                    product_id INTEGER PRIMARY KEY,
+                    source_title TEXT NOT NULL,
+                    normalized_product_name TEXT,
+                    normalized_product_name_zh TEXT,
+                    normalization_method TEXT NOT NULL,
+                    normalization_confidence TEXT NOT NULL,
+                    normalization_version TEXT NOT NULL,
+                    normalized_at TEXT NOT NULL,
+                    FOREIGN KEY(product_id) REFERENCES products(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS product_families (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    family_key TEXT NOT NULL UNIQUE,
+                    canonical_name TEXT NOT NULL,
+                    canonical_name_zh TEXT,
+                    primary_category TEXT NOT NULL DEFAULT '',
+                    product_type TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    grouping_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS product_family_members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    family_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL UNIQUE,
+                    match_method TEXT NOT NULL,
+                    match_score REAL NOT NULL,
+                    reviewed INTEGER NOT NULL DEFAULT 0,
+                    manual_override INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(family_id) REFERENCES product_families(id),
+                    FOREIGN KEY(product_id) REFERENCES products(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS product_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pipeline_run_id TEXT NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    source_platform TEXT NOT NULL,
+                    was_new INTEGER NOT NULL DEFAULT 0,
+                    was_updated INTEGER NOT NULL DEFAULT 0,
+                    evidence_snapshot_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(pipeline_run_id, product_id),
+                    FOREIGN KEY(pipeline_run_id) REFERENCES pipeline_runs(run_id),
+                    FOREIGN KEY(product_id) REFERENCES products(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS source_evidence_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_id INTEGER NOT NULL,
+                    family_id INTEGER,
+                    pipeline_run_id TEXT,
+                    source_platform TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    evidence_type TEXT NOT NULL,
+                    metric_name TEXT NOT NULL,
+                    numeric_value REAL,
+                    text_value TEXT,
+                    raw_reference TEXT NOT NULL DEFAULT '{}',
+                    evidence_version TEXT NOT NULL,
+                    evidence_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(product_id) REFERENCES products(id),
+                    FOREIGN KEY(family_id) REFERENCES product_families(id),
+                    FOREIGN KEY(pipeline_run_id) REFERENCES pipeline_runs(run_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_observations_run ON product_observations(pipeline_run_id);
+                CREATE INDEX IF NOT EXISTS idx_family_members_family ON product_family_members(family_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_product ON source_evidence_snapshots(product_id);
                 """
             )
             _ensure_filter_columns(connection)
@@ -253,6 +345,7 @@ def init_db() -> bool:
             _ensure_triage_unique_key(connection)
             _ensure_triage_bilingual_columns(connection)
             _ensure_pipeline_stats_column(connection)
+            _ensure_shadow_columns(connection)
         return True
     except (OSError, sqlite3.Error):
         return False
@@ -301,6 +394,21 @@ def _ensure_pipeline_stats_column(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE pipeline_runs ADD COLUMN stats_json TEXT NOT NULL DEFAULT '{}'"
         )
+
+
+def _ensure_shadow_columns(connection: sqlite3.Connection) -> None:
+    """Add Phase 11C concrete-product fields to an existing Shadow table."""
+    existing = {
+        row["name"] for row in connection.execute("PRAGMA table_info(product_eligibility)")
+    }
+    definitions = {
+        "concrete_product_status": "TEXT NOT NULL DEFAULT 'AMBIGUOUS'",
+        "concrete_product_reason": "TEXT NOT NULL DEFAULT ''",
+        "concrete_product_version": "TEXT NOT NULL DEFAULT 'concrete-v1'",
+    }
+    for name, definition in definitions.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE product_eligibility ADD COLUMN {name} {definition}")
 
 
 def _ensure_lifecycle_columns(connection: sqlite3.Connection) -> None:
@@ -1067,6 +1175,443 @@ def complete_re_evaluation(request_id: int) -> bool:
         return cursor.rowcount == 1
     except sqlite3.Error:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 evidence-first shadow repository. These additive APIs intentionally
+# do not alter legacy Product/Candidate/AI behavior.
+
+
+def get_product_record_by_url(url: str) -> dict | None:
+    """Return a complete stored Product row without changing it."""
+    try:
+        with _connect() as connection:
+            row = connection.execute("SELECT * FROM products WHERE url = ?", (url,)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["raw_data"] = _decode_json(result.get("raw_data"), {})
+        return result
+    except Exception:
+        return None
+
+
+def get_all_product_records() -> list[dict]:
+    """Return all source records for deterministic shadow processing."""
+    try:
+        with _connect() as connection:
+            rows = connection.execute("SELECT * FROM products ORDER BY id").fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["raw_data"] = _decode_json(item.get("raw_data"), {})
+            output.append(item)
+        return output
+    except Exception:
+        return []
+
+
+def _product_from_record(record: dict) -> Product:
+    return Product(
+        project_id=record["project_id"], source_platform=record["source_platform"],
+        url=record["url"], title=record["title"],
+        description=record.get("description") or "", category=record["category"],
+        image_url=record["image_url"], raw_data=_decode_json(record.get("raw_data"), {}),
+    )
+
+
+def save_shadow_product_foundation(
+    product_id: int,
+    product: Product,
+    eligibility,
+    concrete,
+    identity,
+    family,
+    evidence_facts,
+    *,
+    pipeline_run_id: str | None = None,
+    observed_at: str | None = None,
+    was_new: bool = False,
+    was_updated: bool = False,
+) -> dict:
+    """Persist one deterministic shadow projection in one transaction."""
+    from evidence_foundation import EVIDENCE_VERSION, GROUPING_VERSION
+
+    now = observed_at or _utc_now()
+    family_id = None
+    evidence_ids: list[int] = []
+    try:
+        with _connect() as connection:
+            connection.execute(
+                """INSERT INTO product_eligibility
+                   (product_id, content_type, eligibility_status, eligibility_reason,
+                    eligibility_version, concrete_product_status,
+                    concrete_product_reason, concrete_product_version, evaluated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(product_id) DO UPDATE SET
+                    content_type=excluded.content_type,
+                    eligibility_status=excluded.eligibility_status,
+                    eligibility_reason=excluded.eligibility_reason,
+                    eligibility_version=excluded.eligibility_version,
+                    concrete_product_status=excluded.concrete_product_status,
+                    concrete_product_reason=excluded.concrete_product_reason,
+                    concrete_product_version=excluded.concrete_product_version,
+                    evaluated_at=excluded.evaluated_at""",
+                (product_id, eligibility.content_type, eligibility.eligibility_status,
+                 eligibility.reason, eligibility.version, concrete.status,
+                 concrete.reason, concrete.version, now),
+            )
+            connection.execute(
+                """INSERT INTO product_identities
+                   (product_id, source_title, normalized_product_name,
+                    normalized_product_name_zh, normalization_method,
+                    normalization_confidence, normalization_version, normalized_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(product_id) DO UPDATE SET
+                    source_title=excluded.source_title,
+                    normalized_product_name=excluded.normalized_product_name,
+                    normalized_product_name_zh=COALESCE(excluded.normalized_product_name_zh,
+                                                        product_identities.normalized_product_name_zh),
+                    normalization_method=excluded.normalization_method,
+                    normalization_confidence=excluded.normalization_confidence,
+                    normalization_version=excluded.normalization_version,
+                    normalized_at=excluded.normalized_at""",
+                (product_id, identity.source_title, identity.normalized_product_name,
+                 identity.normalized_product_name_zh, identity.method,
+                 identity.confidence, identity.version, now),
+            )
+            if (family is None or eligibility.eligibility_status != "ELIGIBLE"
+                    or concrete.status != "CONCRETE"):
+                connection.execute(
+                    """DELETE FROM product_family_members
+                       WHERE product_id=? AND manual_override=?""",
+                    (product_id, False),
+                )
+            if (family is not None and eligibility.eligibility_status == "ELIGIBLE"
+                    and concrete.status == "CONCRETE"):
+                connection.execute(
+                    """INSERT INTO product_families
+                       (family_key, canonical_name, canonical_name_zh, primary_category,
+                        product_type, first_seen_at, last_seen_at, status,
+                        grouping_version, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+                       ON CONFLICT(family_key) DO UPDATE SET
+                        last_seen_at=excluded.last_seen_at,
+                        status='ACTIVE',
+                        canonical_name_zh=COALESCE(product_families.canonical_name_zh,
+                                                   excluded.canonical_name_zh),
+                        updated_at=excluded.updated_at""",
+                    (family.family_key, family.canonical_name,
+                     identity.normalized_product_name_zh, product.category,
+                     family.product_type, now, now, GROUPING_VERSION, now, now),
+                )
+                family_row = connection.execute(
+                    "SELECT id FROM product_families WHERE family_key = ?", (family.family_key,)
+                ).fetchone()
+                family_id = family_row["id"]
+                connection.execute(
+                    """INSERT INTO product_family_members
+                       (family_id, product_id, match_method, match_score,
+                        reviewed, manual_override, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(product_id) DO UPDATE SET
+                        family_id=CASE WHEN product_family_members.manual_override THEN
+                            product_family_members.family_id ELSE excluded.family_id END,
+                        match_method=CASE WHEN product_family_members.manual_override THEN
+                            product_family_members.match_method ELSE excluded.match_method END,
+                        match_score=CASE WHEN product_family_members.manual_override THEN
+                            product_family_members.match_score ELSE excluded.match_score END""",
+                    (family_id, product_id, family.match_method, family.match_score,
+                     False, False, now),
+                )
+            for fact in evidence_facts:
+                scope = pipeline_run_id or "historical"
+                evidence_key = f"{scope}:{product_id}:{fact.metric_name}"
+                connection.execute(
+                    """INSERT INTO source_evidence_snapshots
+                       (product_id, family_id, pipeline_run_id, source_platform,
+                        observed_at, evidence_type, metric_name, numeric_value,
+                        text_value, raw_reference, evidence_version, evidence_key, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(evidence_key) DO UPDATE SET
+                        family_id=excluded.family_id,
+                        observed_at=excluded.observed_at,
+                        numeric_value=excluded.numeric_value,
+                        text_value=excluded.text_value,
+                        raw_reference=excluded.raw_reference,
+                        evidence_version=excluded.evidence_version""",
+                    (product_id, family_id, pipeline_run_id, product.source_platform,
+                     now, fact.evidence_type, fact.metric_name, fact.numeric_value,
+                     fact.text_value, json.dumps({"raw_data_key": fact.metric_name}),
+                     EVIDENCE_VERSION, evidence_key, now),
+                )
+                evidence_row = connection.execute(
+                    "SELECT id FROM source_evidence_snapshots WHERE evidence_key = ?",
+                    (evidence_key,),
+                ).fetchone()
+                evidence_ids.append(evidence_row["id"])
+            if pipeline_run_id:
+                connection.execute(
+                    """INSERT INTO product_observations
+                       (pipeline_run_id, product_id, observed_at, source_platform,
+                        was_new, was_updated, evidence_snapshot_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(pipeline_run_id, product_id) DO UPDATE SET
+                        observed_at=excluded.observed_at,
+                        was_new=product_observations.was_new OR excluded.was_new,
+                        was_updated=product_observations.was_updated OR excluded.was_updated,
+                        evidence_snapshot_id=COALESCE(excluded.evidence_snapshot_id,
+                                                      product_observations.evidence_snapshot_id)""",
+                    (pipeline_run_id, product_id, now, product.source_platform,
+                     bool(was_new), bool(was_updated), evidence_ids[0] if evidence_ids else None, now),
+                )
+        return {"product_id": product_id, "family_id": family_id,
+                "evidence_records": len(evidence_ids), "observed": bool(pipeline_run_id)}
+    except Exception:
+        return {"product_id": product_id, "family_id": None,
+                "evidence_records": 0, "observed": False}
+
+
+def get_latest_completed_run() -> dict | None:
+    """Return the latest completed/partial run, independent of calendar date."""
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM pipeline_runs
+                   WHERE status IN ('COMPLETED', 'PARTIAL') AND finished_at IS NOT NULL
+                   ORDER BY finished_at DESC LIMIT 1"""
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def get_observations_for_run(run_id: str) -> list[dict]:
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """SELECT o.*, p.url, p.title, p.description, p.category, p.raw_data
+                   FROM product_observations o JOIN products p ON p.id=o.product_id
+                   WHERE o.pipeline_run_id=? ORDER BY o.id""", (run_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+def get_products_for_run(run_id: str) -> list[dict]:
+    return get_observations_for_run(run_id)
+
+
+def get_supported_product_records_for_run(run_id: str) -> list[dict]:
+    """Infer only observations supported by a run interval and source ledger.
+
+    This is intended for the bounded first shadow backfill. It does not infer
+    membership from ``first_seen_at`` and ignores failed/empty sources.
+    """
+    try:
+        with _connect() as connection:
+            run = connection.execute(
+                "SELECT started_at, finished_at FROM pipeline_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if not run or not run["finished_at"]:
+                return []
+            sources = connection.execute(
+                """SELECT source_platform FROM pipeline_source_runs
+                   WHERE run_id=? AND failed=? AND fetched>0""", (run_id, False),
+            ).fetchall()
+            names = [row["source_platform"] for row in sources]
+            if not names:
+                return []
+            placeholders = ",".join("?" for _ in names)
+            rows = connection.execute(
+                f"""SELECT * FROM products
+                    WHERE source_platform IN ({placeholders})
+                      AND last_seen_at>=? AND last_seen_at<=?
+                    ORDER BY id""",
+                tuple(names) + (run["started_at"], run["finished_at"]),
+            ).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["raw_data"] = _decode_json(item.get("raw_data"), {})
+            output.append(item)
+        return output
+    except Exception:
+        return []
+
+
+def get_daily_discovery(run_id: str | None = None) -> list[dict]:
+    """Return every eligible family observed in a run; never Top-N or AI-gated."""
+    selected = {"run_id": run_id} if run_id else get_latest_completed_run()
+    if not selected:
+        return []
+    run_id = selected["run_id"]
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """SELECT f.id AS family_id, f.canonical_name, f.canonical_name_zh,
+                          f.primary_category, f.product_type, f.first_seen_at,
+                          f.last_seen_at, COUNT(DISTINCT p.source_platform) AS source_count
+                   FROM product_observations o
+                   JOIN products p ON p.id=o.product_id
+                   JOIN product_eligibility e ON e.product_id=p.id
+                   JOIN product_family_members fm ON fm.product_id=p.id
+                   JOIN product_families f ON f.id=fm.family_id
+                   WHERE o.pipeline_run_id=? AND e.eligibility_status='ELIGIBLE'
+                     AND e.concrete_product_status='CONCRETE'
+                   GROUP BY f.id, f.canonical_name, f.canonical_name_zh,
+                            f.primary_category, f.product_type,
+                            f.first_seen_at, f.last_seen_at
+                   ORDER BY f.canonical_name""", (run_id,)
+            ).fetchall()
+            output = []
+            for row in rows:
+                item = dict(row)
+                sources = connection.execute(
+                    """SELECT DISTINCT p.source_platform, p.url, p.id AS product_id,
+                                      p.description
+                       FROM product_observations o JOIN products p ON p.id=o.product_id
+                       JOIN product_family_members fm ON fm.product_id=p.id
+                       WHERE o.pipeline_run_id=? AND fm.family_id=?
+                       ORDER BY p.source_platform, p.id""", (run_id, item["family_id"]),
+                ).fetchall()
+                item["source_records"] = [dict(source) for source in sources]
+                item["source_platforms"] = sorted({source["source_platform"] for source in sources})
+                descriptions = [
+                    " ".join(str(source.get("description") or "").split())
+                    for source in item["source_records"]
+                    if str(source.get("description") or "").strip()
+                ]
+                item["factual_description"] = min(descriptions, key=len)[:300] if descriptions else ""
+                evidence_rows = connection.execute(
+                    """SELECT source_platform, metric_name, numeric_value, text_value
+                       FROM source_evidence_snapshots
+                       WHERE family_id=? AND pipeline_run_id=?
+                       ORDER BY source_platform, metric_name""",
+                    (item["family_id"], run_id),
+                ).fetchall()
+                from evidence_foundation import EvidenceFact, assess_evidence_strength
+                grouped: dict[str, list] = {}
+                for evidence in evidence_rows:
+                    grouped.setdefault(evidence["source_platform"], []).append(EvidenceFact(
+                        evidence["metric_name"], evidence["numeric_value"], evidence["text_value"],
+                    ))
+                assessments = [
+                    assess_evidence_strength(
+                        source, facts, independent_source_count=len(item["source_platforms"]),
+                    )
+                    for source, facts in grouped.items()
+                ]
+                order = {"WEAK": 0, "MODERATE": 1, "STRONG": 2}
+                strongest = max(assessments, key=lambda value: order[value.strength], default=None)
+                item["evidence_strength"] = strongest.strength if strongest else "WEAK"
+                item["evidence_reasons"] = strongest.reasons if strongest else [
+                    "No source-native market metrics are currently available."
+                ]
+                item["latest_run_id"] = run_id
+                output.append(item)
+        return output
+    except Exception:
+        return []
+
+
+def get_shadow_counts() -> dict[str, int]:
+    tables = (
+        "products", "product_eligibility", "product_identities", "product_families",
+        "product_family_members", "product_observations", "source_evidence_snapshots",
+        "user_product_feedback", "re_evaluation_requests",
+    )
+    counts = {}
+    try:
+        with _connect() as connection:
+            for table in tables:
+                counts[table] = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            counts["active_product_families"] = connection.execute(
+                "SELECT COUNT(*) FROM product_families WHERE status='ACTIVE'"
+            ).fetchone()[0]
+        return counts
+    except Exception:
+        return counts
+
+
+def prune_empty_shadow_families() -> int:
+    """Deactivate orphaned shadow families while preserving grouping history."""
+    try:
+        with _connect() as connection:
+            cursor = connection.execute(
+                """UPDATE product_families SET status='INACTIVE', updated_at=?
+                   WHERE status='ACTIVE' AND NOT EXISTS (
+                     SELECT 1 FROM product_family_members fm
+                     WHERE fm.family_id=product_families.id
+                   )""", (_utc_now(),)
+            )
+        return max(0, cursor.rowcount)
+    except Exception:
+        return 0
+
+
+def refresh_shadow_family_canonical_names() -> int:
+    """Choose concise canonical names from the best deterministic identities."""
+    updated = 0
+    try:
+        with _connect() as connection:
+            families = connection.execute("SELECT id FROM product_families").fetchall()
+            now = _utc_now()
+            for family in families:
+                manually_reviewed = connection.execute(
+                    """SELECT 1 FROM product_family_members
+                       WHERE family_id=? AND manual_override=? LIMIT 1""",
+                    (family["id"], True),
+                ).fetchone()
+                if manually_reviewed:
+                    continue
+                choices = connection.execute(
+                    """SELECT i.normalized_product_name, i.normalized_product_name_zh,
+                              i.normalization_confidence
+                       FROM product_family_members fm
+                       JOIN product_identities i ON i.product_id=fm.product_id
+                       JOIN product_eligibility e ON e.product_id=fm.product_id
+                       WHERE fm.family_id=? AND e.eligibility_status='ELIGIBLE'
+                         AND e.concrete_product_status='CONCRETE'
+                         AND i.normalized_product_name IS NOT NULL
+                       ORDER BY CASE i.normalization_confidence
+                                  WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END,
+                                LENGTH(i.normalized_product_name), i.product_id
+                       LIMIT 1""", (family["id"],),
+                ).fetchone()
+                if not choices:
+                    continue
+                cursor = connection.execute(
+                    """UPDATE product_families
+                       SET canonical_name=?,
+                           canonical_name_zh=COALESCE(?, canonical_name_zh),
+                           updated_at=? WHERE id=?""",
+                    (choices["normalized_product_name"],
+                     choices["normalized_product_name_zh"], now, family["id"]),
+                )
+                updated += int(cursor.rowcount == 1)
+        return updated
+    except Exception:
+        return 0
+
+
+def get_family_feedback(family_id: int) -> list[dict]:
+    """Project existing Product feedback onto a family without migrating it."""
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """SELECT uf.*, fm.family_id, fm.product_id
+                   FROM product_family_members fm
+                   JOIN user_product_feedback uf
+                     ON uf.entity_type='product' AND uf.entity_id=CAST(fm.product_id AS TEXT)
+                   WHERE fm.family_id=? ORDER BY uf.updated_at DESC, uf.id DESC""",
+                (family_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
 
 
 def save_candidates(

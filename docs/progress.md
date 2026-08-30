@@ -1127,7 +1127,7 @@ Status: Completed
 
 ## Phase 9.7 - Product Picker Web App MVP
 
-状态：  
+状态：
 Completed
 
 日期：2026-08-26
@@ -1218,3 +1218,47 @@ Completed
 - Streamlit仅需`DATABASE_URL`；GitHub Actions使用`DATABASE_URL`和`GEMINI_API_KEY`。
 - 新增云端read-only/feedback健康检查入口及Neon、Streamlit、GitHub Actions逐步文档。
 - Gemini API calls 0、scraper calls 0、真实Cloud deployment未开始。
+
+### Phase 11B - Evidence-First Data Foundation / Shadow Mode
+
+状态：Completed in shadow mode
+
+- 在不改变现有UI、WxPusher、Candidate、Gemini与Ranking生产路径的前提下，新增可同时用于SQLite/PostgreSQL的增量Shadow schema。
+- 旧路径保持：`Source → Candidate → Gemini → Qualified → Top Picks`。
+- 新Shadow路径：`Source → Observation → Eligibility → Product Identity → Product Family → Evidence → Daily Discovery`。
+- `product_observations`以Pipeline Run为成员边界，不再使用`first_seen_at`推断Today；历史Observation仅在run时间区间和source ledger共同支持时回填。
+- Eligibility只判断来源记录中是否存在可识别的实体、软件或产品设计，不判断商业价值；明显电影/活动内容保留原Product但从Daily Discovery排除。
+- `products.title`继续保持原语义；标准化名称和中文名称进入独立、版本化identity表，无法可靠识别时保持unresolved。
+- Product Family使用保守的确定性blocking/token/synonym规则，原始Product及其URL/raw_data始终保留。
+- Evidence仅提取已存储的来源事实；WEAK/MODERATE/STRONG表示证据量，不是机会分或销售建议。
+- Daily Discovery返回最新已完成run中全部Eligible Family，不受Top-N、Gemini PASS或Qualified限制。
+- AI未被删除；未来职责是翻译、歧义身份识别和真实证据摘要，不是最终商业裁判，也不是Eligibility/Daily Discovery的必要Gate。
+- 现有Product级Favorite/Watch/Not Interested和re-evaluation历史不迁移、不删除；Family层可只读投影已有Favorite。
+- 本阶段未调用Gemini、未抓取外部来源、未调用WxPusher，生产UI与生产通知未切换。
+
+### Phase 11C - Product Discovery Quality Gate
+
+状态：Completed in shadow mode
+
+- 明确区分`ELIGIBLE`与可发现性：只有`eligibility_status=ELIGIBLE`且`concrete_product_status=CONCRETE`的来源记录才能进入Daily Discovery。
+- 新增版本化Concrete Product Gate，按来源排除trip report、itinerary、通用建议、宽泛brainstorm、multi-item EDC、listicle、客服投诉、电影/活动等噪声；原始Product与证据仍完整保留。
+- 名称规范化升级为来源感知：Amazon目录标题压缩为品牌/型号+核心产品名，Reddit问题提取具体产品名，Product Hunt保留品牌并添加简短软件类型，Yanko提取具体设计对象。
+- Family canonical name优先人工override，其次最高置信度、最短且信息充分的normalized identity；旧grouping记录以`INACTIVE`保留审计历史，不物理删除。
+- Shadow Daily Discovery继续基于最新Run Observation、Family和事实Evidence，不要求Candidate、Gemini、Qualified、Final Score或Top-N。
+- 新规则降低trip report、泛讨论、listicle与多商品噪声，同时保留所有raw_data、旧AI/Ranking数据和Product级反馈。
+- 未来来源路线：Priority 1 Etsy；Priority 2 Hacker News/Show HN、软件类Reddit扩展、Design Milk；Priority 3 GitHub；Core77需先做access/feed probe；Designboom后续复核。
+- 所有未来来源必须走`Source → Observation → Eligibility → Concrete Product Gate → Product Identity → Product Family → Evidence → Daily Discovery`，不得重新以`Candidate → Gemini → Qualified`作为主要可见性Gate。
+- 本阶段未切换Streamlit/WxPusher、未新增来源、未调用Gemini或外部scraper。
+
+### Phase 11D - Clean Production Reset + Fresh Evidence-First Validation
+
+状态：Prepared; production audit/reset not yet executed
+
+- 新增仅允许`workflow_dispatch`的生产审计/重置工作流；无cron，且与Daily Pipeline共用concurrency group，避免同时写入。
+- 第一轮必须选择`audit`，只读检查Neon schema、约束、索引、外键、表计数以及Favorite Product完整性。
+- `reset_and_validate`必须输入精确确认词；在同一事务中创建Neon archive schema并逐表核对备份行数，备份失败或Favorite不完整时自动回滚并停止。
+- 重置仅保留Favorite Product、原始source/raw_data、Identity、必要Family关系和事实Evidence；删除其他旧Product及旧Candidate/AI/Ranking/Observation/Run状态，不DROP表或schema。
+- Fresh validation关闭Gemini与WxPusher凭据，只运行当前六个来源一次；Today仍严格由最新run的`product_observations`决定，历史Favorite不会自动进入Today。
+- 完整Daily Discovery、20条NON_CONCRETE、20条AMBIGUOUS、可疑通过、Family/Evidence审计均输出为GitHub Actions artifact，保留30天。
+- 当前只准备代码；在用户通过GitHub Desktop提交并推送前，不执行生产audit/reset。
+- Phase 11E来源路线保持：Priority 1 Etsy；Priority 2 Hacker News/Show HN、软件类Reddit、Design Milk；Priority 3 GitHub；Core77条件probe；Designboom后续复核。

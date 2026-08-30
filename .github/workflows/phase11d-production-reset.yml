@@ -1,0 +1,96 @@
+name: Phase 11D Production Audit and Reset
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "audit is read-only; reset_and_validate creates a Neon backup, resets, then runs once"
+        required: true
+        type: choice
+        options:
+          - audit
+          - reset_and_validate
+        default: audit
+      confirm_reset:
+        description: "For reset_and_validate only: type RESET_NON_FAVORITES exactly"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-product-picker
+  cancel-in-progress: false
+
+jobs:
+  phase11d:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PHASE11D_ARTIFACT_DIR: phase11d-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+      - name: Require production database secret
+        shell: bash
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL repository secret is missing" >&2
+            exit 2
+          fi
+      - name: Read-only production audit
+        run: python scripts/phase11d_production_reset.py audit --output-dir "$PHASE11D_ARTIFACT_DIR"
+      - name: Require explicit reset confirmation
+        if: inputs.mode == 'reset_and_validate'
+        shell: bash
+        env:
+          CONFIRM_RESET: ${{ inputs.confirm_reset }}
+        run: |
+          if [ "$CONFIRM_RESET" != "RESET_NON_FAVORITES" ]; then
+            echo "Reset confirmation did not match; no reset performed" >&2
+            exit 2
+          fi
+      - name: Backup and reset non-favorite discovery data
+        if: inputs.mode == 'reset_and_validate'
+        env:
+          CONFIRM_RESET: ${{ inputs.confirm_reset }}
+        run: >-
+          python scripts/phase11d_production_reset.py reset
+          --output-dir "$PHASE11D_ARTIFACT_DIR"
+          --confirm "$CONFIRM_RESET"
+          --apply-additive-schema
+      - name: Run one fresh Evidence-First production pipeline
+        if: inputs.mode == 'reset_and_validate'
+        env:
+          GEMINI_API_KEY: ""
+          WXPUSHER_APP_TOKEN: ""
+          WXPUSHER_UID: ""
+          PRODUCTION_DAILY: "false"
+          MAX_DAILY_TRIAGE_CALLS: "1"
+        run: python run_daily.py
+      - name: Validate fresh Evidence-First result
+        if: inputs.mode == 'reset_and_validate'
+        env:
+          GEMINI_API_KEY: ""
+          WXPUSHER_APP_TOKEN: ""
+          WXPUSHER_UID: ""
+        run: >-
+          python scripts/phase11d_production_reset.py validate
+          --output-dir "$PHASE11D_ARTIFACT_DIR"
+          --reset-result "$PHASE11D_ARTIFACT_DIR/reset_result.json"
+      - name: Upload Phase 11D reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase11d-${{ inputs.mode }}-${{ github.run_id }}
+          path: phase11d-artifacts/
+          if-no-files-found: error
+          retention-days: 30

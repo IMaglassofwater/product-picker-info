@@ -288,6 +288,14 @@ def run_pipeline(
             continue
         saved_count += source_saved
         duplicate_count += source_duplicates
+        # Phase 11 shadow path: record explicit run membership and build the
+        # deterministic evidence projection without affecting legacy output,
+        # candidate creation, AI qualification, UI, or notification behavior.
+        if run_id:
+            from evidence_shadow import process_products_for_run
+            process_products_for_run(
+                run_id, source_products, existing_urls=existing_urls,
+            )
     with timed_stage(output, "candidate_creation_update"):
         validated_candidates = [
             candidate

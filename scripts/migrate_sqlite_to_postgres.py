@@ -132,6 +132,33 @@ def _production_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3.R
         "specificity_results": ("SELECT * FROM specificity_results", ()),
         "user_product_feedback": ("SELECT * FROM user_product_feedback WHERE 0=1", ()),
         "re_evaluation_requests": ("SELECT * FROM re_evaluation_requests WHERE 0=1", ()),
+        "product_eligibility": (
+            f"SELECT e.* FROM product_eligibility e JOIN products p ON p.id=e.product_id "
+            f"WHERE lower(p.source_platform) IN ({placeholders})", sources,
+        ),
+        "product_identities": (
+            f"SELECT i.* FROM product_identities i JOIN products p ON p.id=i.product_id "
+            f"WHERE lower(p.source_platform) IN ({placeholders})", sources,
+        ),
+        "product_families": (
+            f"SELECT DISTINCT f.* FROM product_families f "
+            f"JOIN product_family_members fm ON fm.family_id=f.id "
+            f"JOIN products p ON p.id=fm.product_id "
+            f"WHERE lower(p.source_platform) IN ({placeholders})", sources,
+        ),
+        "product_family_members": (
+            f"SELECT fm.* FROM product_family_members fm JOIN products p ON p.id=fm.product_id "
+            f"WHERE lower(p.source_platform) IN ({placeholders})", sources,
+        ),
+        "product_observations": (
+            f"SELECT o.* FROM product_observations o JOIN products p ON p.id=o.product_id "
+            f"WHERE lower(p.source_platform) IN ({placeholders}) "
+            "AND EXISTS (SELECT 1 FROM pipeline_runs r WHERE r.run_id=o.pipeline_run_id)", sources,
+        ),
+        "source_evidence_snapshots": (
+            f"SELECT e.* FROM source_evidence_snapshots e JOIN products p ON p.id=e.product_id "
+            f"WHERE lower(p.source_platform) IN ({placeholders})", sources,
+        ),
     }
     return {table: connection.execute(sql, params).fetchall() for table, (sql, params) in queries.items()}
 
@@ -147,6 +174,8 @@ def execute_production_migration(source: Path, database_url: str) -> dict[str, i
     boolean_columns = {
         "ai_triage_results": {"needs_deep_analysis"},
         "pipeline_source_runs": {"failed"},
+        "product_family_members": {"reviewed", "manual_override"},
+        "product_observations": {"was_new", "was_updated"},
     }
     copied: dict[str, int] = {}
     with postgres_connection(database_url) as target:
@@ -166,6 +195,8 @@ def execute_production_migration(source: Path, database_url: str) -> dict[str, i
             "ai_triage_results", "deep_analysis_results", "software_analysis_results",
             "product_metric_snapshots", "pipeline_source_runs", "specificity_results",
             "user_product_feedback", "re_evaluation_requests",
+            "product_families", "product_family_members", "product_observations",
+            "source_evidence_snapshots",
         }
         for table in identity_tables:
             if copied.get(table):
