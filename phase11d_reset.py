@@ -285,30 +285,122 @@ def favorite_integrity(connection) -> dict:
     }
 
 
+def _product_id_hash(connection) -> str:
+    row = connection.execute(
+        "SELECT md5(COALESCE(string_agg(id::text, ',' ORDER BY id), '')) AS digest FROM products"
+    ).fetchone()
+    return str(row["digest"])
+
+
+def _audit_snapshot(connection, mode: str) -> dict:
+    schema = validate_schema(connection)
+    counts = _table_counts(connection, DISCOVERY_TABLES + OPTIONAL_DERIVED_TABLES)
+    favorites = favorite_integrity(connection) if "user_product_feedback" in counts else {
+        "favorite_rows": 0, "favorite_product_ids": [], "favorited_products": 0,
+        "orphan_product_ids": [], "products": [],
+    }
+    product_count = counts.get("products", 0)
+    return {
+        "mode": mode,
+        "generated_at": datetime.now(timezone.utc),
+        "schema": schema,
+        "counts": counts,
+        "favorites": favorites,
+        "product_id_hash": _product_id_hash(connection) if "products" in counts else "",
+        "summary": {
+            "products": product_count,
+            "favorited_products": favorites["favorited_products"],
+            "non_favorited_products": product_count - favorites["favorited_products"],
+            "safe_to_prepare_reset": bool(schema["compatible"] and not favorites["orphan_product_ids"]),
+        },
+    }
+
+
 def audit_production(database_url: str, output_dir: Path) -> dict:
     with _connect(database_url) as connection:
         connection.execute("SET TRANSACTION READ ONLY")
-        schema = validate_schema(connection)
-        counts = _table_counts(connection, DISCOVERY_TABLES + OPTIONAL_DERIVED_TABLES)
-        favorites = favorite_integrity(connection) if "user_product_feedback" in counts else {
-            "favorite_rows": 0, "favorite_product_ids": [], "favorited_products": 0,
-            "orphan_product_ids": [], "products": [],
-        }
-        product_count = counts.get("products", 0)
-        report = {
-            "mode": "audit",
-            "generated_at": datetime.now(timezone.utc),
-            "schema": schema,
-            "counts": counts,
-            "favorites": favorites,
-            "summary": {
-                "products": product_count,
-                "favorited_products": favorites["favorited_products"],
-                "non_favorited_products": product_count - favorites["favorited_products"],
-                "safe_to_prepare_reset": bool(schema["compatible"] and not favorites["orphan_product_ids"]),
-            },
-        }
+        report = _audit_snapshot(connection, "audit")
     write_json(output_dir / "pre_reset_audit.json", report)
+    return report
+
+
+def deploy_evidence_schema(database_url: str, output_dir: Path) -> dict:
+    """Deploy Phase 11C DDL and prove all existing Product/Favorite data is unchanged."""
+    from postgres_backend import evidence_schema_statements
+
+    with _connect(database_url) as connection:
+        connection.execute("SET LOCAL lock_timeout='15s'")
+        connection.execute("SET LOCAL statement_timeout='5min'")
+        connection.execute("LOCK TABLE products, user_product_feedback IN SHARE MODE")
+        before = _audit_snapshot(connection, "schema_before")
+        before_tables = set(_public_tables(connection))
+        before_indexes = {
+            (row["table_name"], row["index_name"]) for row in before["schema"]["indexes"]
+        }
+        before_constraints = {
+            (row["table_name"], row["constraint_name"]) for row in before["schema"]["constraints"]
+        }
+        for statement in evidence_schema_statements():
+            connection.execute(statement)
+        after = _audit_snapshot(connection, "schema_after")
+        after_tables = set(_public_tables(connection))
+        after_indexes = {
+            (row["table_name"], row["index_name"]) for row in after["schema"]["indexes"]
+        }
+        after_constraints = {
+            (row["table_name"], row["constraint_name"]) for row in after["schema"]["constraints"]
+        }
+
+        before_favorites = before["favorites"]
+        after_favorites = after["favorites"]
+        before_hashes = {
+            row["product_id"]: row["raw_data_hash"] for row in before_favorites["products"]
+        }
+        after_hashes = {
+            row["product_id"]: row["raw_data_hash"] for row in after_favorites["products"]
+        }
+        invariant_errors = []
+        if before["summary"]["products"] != after["summary"]["products"]:
+            invariant_errors.append("Product count changed")
+        if before["product_id_hash"] != after["product_id_hash"]:
+            invariant_errors.append("Product ID set changed")
+        if before_favorites["favorite_rows"] != after_favorites["favorite_rows"]:
+            invariant_errors.append("Favorite row count changed")
+        if before_favorites["favorite_product_ids"] != after_favorites["favorite_product_ids"]:
+            invariant_errors.append("Favorite Product ID set changed")
+        if before_hashes != after_hashes:
+            invariant_errors.append("Favorite raw_data changed")
+        if not after["schema"]["compatible"]:
+            invariant_errors.append("Evidence-First schema remains incompatible")
+        if invariant_errors:
+            raise Phase11DSafetyError("; ".join(invariant_errors))
+
+        report = {
+            "mode": "deploy_schema",
+            "deployed_at": datetime.now(timezone.utc),
+            "schema_before": before,
+            "schema_after": after,
+            "tables_created": sorted(after_tables - before_tables),
+            "indexes_created": [
+                {"table_name": table, "index_name": index}
+                for table, index in sorted(after_indexes - before_indexes)
+            ],
+            "constraints_created": [
+                {"table_name": table, "constraint_name": constraint}
+                for table, constraint in sorted(after_constraints - before_constraints)
+            ],
+            "products_before": before["summary"]["products"],
+            "products_after": after["summary"]["products"],
+            "favorite_rows_before": before_favorites["favorite_rows"],
+            "favorite_rows_after": after_favorites["favorite_rows"],
+            "favorite_product_ids_before": before_favorites["favorite_product_ids"],
+            "favorite_product_ids_after": after_favorites["favorite_product_ids"],
+            "favorite_raw_data_unchanged": before_hashes == after_hashes,
+            "safe_to_prepare_reset": after["summary"]["safe_to_prepare_reset"],
+            "products_deleted": 0,
+            "historical_backfill_performed": False,
+        }
+    write_json(output_dir / "schema_deployment_report.json", report)
     return report
 
 

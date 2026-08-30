@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from phase11d_reset import (  # noqa: E402
-    Phase11DSafetyError, audit_production, require_database_url,
+    Phase11DSafetyError, audit_production, deploy_evidence_schema, require_database_url,
     reset_non_favorites, validate_fresh_run,
 )
 
@@ -19,6 +19,8 @@ def parser() -> argparse.ArgumentParser:
     subcommands = command.add_subparsers(dest="mode", required=True)
     audit = subcommands.add_parser("audit")
     audit.add_argument("--output-dir", type=Path, required=True)
+    deploy = subcommands.add_parser("deploy-schema")
+    deploy.add_argument("--output-dir", type=Path, required=True)
     reset = subcommands.add_parser("reset")
     reset.add_argument("--output-dir", type=Path, required=True)
     reset.add_argument("--confirm", required=True)
@@ -40,6 +42,15 @@ def main() -> int:
             print(f"Products: {result['summary']['products']}")
             print(f"Favorited Products: {result['summary']['favorited_products']}")
             print(f"Safe to prepare reset: {result['summary']['safe_to_prepare_reset']}")
+        elif arguments.mode == "deploy-schema":
+            result = deploy_evidence_schema(database_url, arguments.output_dir)
+            print("Phase 11D.1 Evidence-First schema deployment complete")
+            print(f"Tables created: {len(result['tables_created'])}")
+            print(f"Products before: {result['products_before']}")
+            print(f"Products after: {result['products_after']}")
+            print(f"Favorite rows before: {result['favorite_rows_before']}")
+            print(f"Favorite rows after: {result['favorite_rows_after']}")
+            print(f"Safe to prepare reset: {result['safe_to_prepare_reset']}")
         elif arguments.mode == "reset":
             result = reset_non_favorites(
                 database_url, arguments.confirm, arguments.output_dir,

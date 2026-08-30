@@ -9,6 +9,7 @@ on:
         type: choice
         options:
           - audit
+          - deploy_schema
           - reset_and_validate
         default: audit
       confirm_reset:
@@ -58,6 +59,16 @@ jobs:
             echo "Reset confirmation did not match; no reset performed" >&2
             exit 2
           fi
+      - name: Deploy additive Evidence-First schema only
+        if: inputs.mode == 'deploy_schema'
+        run: >-
+          python scripts/phase11d_production_reset.py deploy-schema
+          --output-dir "$PHASE11D_ARTIFACT_DIR"
+      - name: Post-deployment read-only production audit
+        if: inputs.mode == 'deploy_schema'
+        run: >-
+          python scripts/phase11d_production_reset.py audit
+          --output-dir "$PHASE11D_ARTIFACT_DIR/post-deploy-audit"
       - name: Backup and reset non-favorite discovery data
         if: inputs.mode == 'reset_and_validate'
         env:

@@ -1262,3 +1262,13 @@ Completed
 - 完整Daily Discovery、20条NON_CONCRETE、20条AMBIGUOUS、可疑通过、Family/Evidence审计均输出为GitHub Actions artifact，保留30天。
 - 当前只准备代码；在用户通过GitHub Desktop提交并推送前，不执行生产audit/reset。
 - Phase 11E来源路线保持：Priority 1 Etsy；Priority 2 Hacker News/Show HN、软件类Reddit、Design Milk；Priority 3 GitHub；Core77条件probe；Designboom后续复核。
+
+### Phase 11D.1 - Deploy Evidence-First Schema to Production Neon
+
+状态：Prepared; manual production deployment not yet executed
+
+- Phase 11D首轮production audit确认899条Products、3条Favorite Products（IDs 1589、1616、2355），无orphan Favorite；reset因缺少六张Evidence-First表而安全停止。
+- 手动workflow新增`deploy_schema`模式，只使用现有`DATABASE_URL` Secret，不读取Gemini或WxPusher Secret，不抓取、不回填、不删除Product。
+- 部署DDL直接从当前`POSTGRES_SCHEMA`筛选Phase 11C六张表、additive concrete字段和对应index，避免第二套schema定义漂移。
+- schema部署与前后数据校验位于同一事务；验证Product总数、完整Product ID集合、Favorite行、Favorite Product IDs及三条Favorite raw_data hash完全不变，否则回滚。
+- 生成`schema_deployment_report.json`与post-deploy read-only audit artifact；部署完成后必须停止，不自动进入`reset_and_validate`。

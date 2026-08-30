@@ -73,6 +73,34 @@ def initialize_postgres_schema(database_url: str) -> None:
                 connection.execute(statement)
 
 
+EVIDENCE_SCHEMA_TABLES = frozenset({
+    "product_observations", "product_eligibility", "product_identities",
+    "product_families", "product_family_members", "source_evidence_snapshots",
+})
+
+
+def evidence_schema_statements() -> list[str]:
+    """Return only the additive Phase 11 Evidence-First DDL statements.
+
+    Statements are selected from ``POSTGRES_SCHEMA`` so the manual deployment
+    cannot drift into a second competing schema definition.
+    """
+    selected = []
+    for statement in POSTGRES_SCHEMA.split(";"):
+        cleaned = statement.strip()
+        lowered = cleaned.casefold()
+        if cleaned and any(re.search(rf"\b{re.escape(table)}\b", lowered) for table in EVIDENCE_SCHEMA_TABLES):
+            selected.append(cleaned)
+    return selected
+
+
+def initialize_evidence_schema(database_url: str) -> None:
+    """Deploy only the additive Evidence-First schema in one transaction."""
+    with postgres_connection(database_url) as connection:
+        for statement in evidence_schema_statements():
+            connection.execute(statement)
+
+
 PRODUCT_BATCH_COLUMNS = (
     "project_id", "source_platform", "url", "title", "description",
     "category", "image_url", "raw_data", "filter_score", "filter_status",

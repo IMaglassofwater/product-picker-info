@@ -54,6 +54,8 @@ def test_phase11d_workflow_is_manual_only_and_safely_bounded():
     )
     assert "workflow_dispatch:" in workflow
     assert "schedule:" not in workflow
+    assert "deploy_schema" in workflow
+    assert "deploy-schema" in workflow
     assert "RESET_NON_FAVORITES" in workflow
     assert "DATABASE_URL: ${{ secrets.DATABASE_URL }}" in workflow
     assert "GEMINI_API_KEY: \"\"" in workflow
@@ -67,3 +69,17 @@ def test_reset_module_never_drops_tables_or_schema():
     assert "DROP SCHEMA" not in source
     assert "CREATE SCHEMA" in source
     assert "products" in DISCOVERY_TABLES
+
+
+def test_evidence_schema_deployment_reuses_only_current_additive_ddl():
+    from postgres_backend import EVIDENCE_SCHEMA_TABLES, evidence_schema_statements
+
+    statements = evidence_schema_statements()
+    combined = "\n".join(statements).casefold()
+    assert statements
+    for table in EVIDENCE_SCHEMA_TABLES:
+        assert table in combined
+    assert "create table if not exists products" not in combined
+    assert "create table if not exists micro_innovation_candidates" not in combined
+    assert "drop table" not in combined
+    assert "drop schema" not in combined
