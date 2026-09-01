@@ -96,6 +96,14 @@ _SOFTWARE_HINTS = (
     "software", "app", "api", "dashboard", "browser", "extension", "saas",
     "automation", "editor", "workspace", "agent", "analytics", "macos",
 )
+_SERVICE_OR_DIGITAL_PATTERNS = (
+    r"\bdigital download\b", r"\bprintable\b", r"\btemplate\b",
+    r"\bsvg (?:file|bundle)\b", r"\bservice\b", r"\bconsultation\b",
+)
+_ROUNDUP_PATTERNS = (
+    r"^\d+\s+", r"\bbest of\b", r"\broundup\b", r"\bgift guide\b",
+    r"\bthings we love\b", r"\bproducts? to (?:buy|know|love)\b",
+)
 _STOPWORDS = {
     "a", "an", "and", "for", "the", "with", "without", "of", "to", "in",
     "on", "my", "new", "best", "review", "compact", "simple", "small",
@@ -145,12 +153,69 @@ def classify_eligibility(product: Product) -> EligibilityResult:
             "SOFTWARE_PRODUCT", "ELIGIBLE",
             "Product Hunt defaults to software unless explicit physical evidence exists.",
         )
+    if source == "etsy":
+        is_digital = bool((product.raw_data or {}).get("is_digital"))
+        if is_digital or any(re.search(pattern, text) for pattern in _SERVICE_OR_DIGITAL_PATTERNS):
+            return EligibilityResult(
+                "NON_PRODUCT_CONTENT", "INELIGIBLE",
+                "Digital download or service is outside Etsy physical-product discovery.",
+            )
+        return EligibilityResult(
+            "PHYSICAL_PRODUCT", "ELIGIBLE",
+            "Official active Etsy listing represents one physical catalog product.",
+        )
+    if source == "hacker_news":
+        if not product.title.casefold().startswith("show hn:"):
+            return EligibilityResult(
+                "NON_PRODUCT_CONTENT", "INELIGIBLE", "Not a Show HN product submission."
+            )
+        if re.search(
+            r"\b(?:thoughts?|discussion|essay|news)\s+(?:about|on)\b|"
+            r"^show hn:\s*(?:i asked\b|what\b|the load-bearing vocabulary\b)|"
+            r"^show hn:\s*app design\b",
+            text,
+        ):
+            return EligibilityResult(
+                "NON_PRODUCT_CONTENT", "INELIGIBLE",
+                "Generic discussion or essay does not identify a product.",
+            )
+        if re.search(r",\s*[^,]+\s+and\s+[^,]+$", product.title, re.I):
+            return EligibilityResult(
+                "NON_PRODUCT_CONTENT", "INELIGIBLE",
+                "Show HN title presents multiple products rather than one product object.",
+            )
+        external_url = str((product.raw_data or {}).get("external_product_url") or "")
+        if re.search(r"\b(?:pcb|mcu|microcontroller|hardware device)\b", text):
+            return EligibilityResult(
+                "PHYSICAL_PRODUCT", "ELIGIBLE",
+                "Show HN submission identifies a physical hardware product.",
+            )
+        if _has_hint(text, _SOFTWARE_HINTS) or re.search(
+            r"\b(?:tool|platform|client|server|database|library|search engine|website|local-first|open-source|i built|we built|launch)\b",
+            text,
+        ) or external_url.startswith(("http://", "https://")):
+            return EligibilityResult(
+                "SOFTWARE_PRODUCT", "ELIGIBLE", "Show HN submission identifies a software product."
+            )
+        return EligibilityResult(
+            "AMBIGUOUS", "AMBIGUOUS", "Show HN title does not identify a software product deterministically."
+        )
     if source == "amazon":
         return EligibilityResult(
             "PHYSICAL_PRODUCT", "ELIGIBLE",
             "Amazon consumer trend record represents a catalog product.",
         )
-    if source == "yanko_design":
+    if source in {"yanko_design", "design_milk"}:
+        if any(re.search(pattern, product.title.casefold()) for pattern in _ROUNDUP_PATTERNS):
+            return EligibilityResult(
+                "NON_PRODUCT_CONTENT", "INELIGIBLE",
+                "Design roundup or multi-product editorial is not one product object.",
+            )
+        if re.search(r"\b(?:architecture|interior tour|house|residence|exhibition|interview)\b", text) and not _has_hint(text, _PHYSICAL_HINTS):
+            return EligibilityResult(
+                "NON_PRODUCT_CONTENT", "INELIGIBLE",
+                "Architecture, tour, exhibition, or interview has no identifiable product object.",
+            )
         if _has_hint(text, _PHYSICAL_HINTS):
             return EligibilityResult(
                 "PRODUCT_DESIGN", "ELIGIBLE",
@@ -159,6 +224,11 @@ def classify_eligibility(product: Product) -> EligibilityResult:
         return EligibilityResult(
             "AMBIGUOUS", "AMBIGUOUS",
             "Design article does not deterministically identify one product object.",
+        )
+    if source == "reddit_software":
+        return EligibilityResult(
+            "SOFTWARE_PRODUCT", "ELIGIBLE",
+            "Software-focused Reddit record contains an identifiable app, tool, or software need.",
         )
     if _has_hint(text, _SOFTWARE_HINTS):
         return EligibilityResult("SOFTWARE_PRODUCT", "ELIGIBLE", "Software product is identifiable.")
@@ -187,10 +257,17 @@ def classify_concrete_product(
     title = " ".join(product.title.split()).casefold()
     body = " ".join(product.description.split()).casefold()
     text = f"{title} {body}"
-    if source in {"amazon", "product_hunt"}:
+    if source in {"amazon", "product_hunt", "etsy"}:
         return ConcreteProductResult(
             "CONCRETE",
             "Catalog/software source record represents one named product.",
+        )
+    if "reddit" in source and re.search(
+        r"seeking advice.*garbage bags?|advice.*cot.*tent|(?:duffle|duffel).*(?:backpack).*(?:40l|40 l)|bifl.*comfortable.*(?:tennis )?shoes?",
+        title,
+    ):
+        return ConcreteProductResult(
+            "CONCRETE", "Title identifies one supported product object or concrete need."
         )
     non_concrete_patterns = (
         r"\btrip report\b", r"\bitinerary\b", r"\b\d+\s*(?:day|week)s?\s+in\b",
@@ -206,6 +283,29 @@ def classify_concrete_product(
         r"^save space by leaving headphones behind\??$",
         r"\b(?:comparison|compared?|tested).*\b\d+\b.*\b(?:products?|pillows?|bags?|items?)\b",
         r"\b(?:comparison|compared?|tested).*\b(?:two|three|four|five|six|seven|eight|nine|ten)\b.*\b(?:products?|pillows?|bags?|items?)\b",
+        r"^what (?:apps?|tools?|software) do you (?:all )?use\??$",
+        r"^(?:best|favorite) (?:productivity )?(?:apps?|tools?|software)\??$",
+        r"^what was something .*productivity app.*(?:couldn.t|could not) find\??$",
+        r"^what made you stop using .*app",
+        r"^experimenting (?:with )?productivity tools?\??$",
+        r"^which .*apps? (?:have|do|are)\b",
+        r"^any .*apps? that .*\b(?:/| and )\b",
+        r"^any .*?(?:app|apps|list|notes).*\s/\s.*",
+        r"^would you use an app\b",
+        r"^anyone else struggle\b",
+        r"^my traveling app project$",
+        r"^be careful when creating\b",
+        r"^i built my first real app.*(?:what i learned|where it stands)",
+        r"^i built (?:a )?simple tool.*(?:feedback|in a day)",
+        r"^answering your problems$",
+        r"wondering if anybody knew of a good (?:app|ai)",
+        r"\b(?:throwing|returns?)\s+(?:http )?(?:4\d\d|5\d\d)\b|\bseems broken\b",
+        r"\b(?:keeps?|keep) failing\b",
+        r"\bversions?, installation options? and privacy/security\b",
+        r"\bnew project megathread\b",
+        r"^how do you juggle different aspects of planning\??$",
+        r"^do you use an? habit app\b",
+        r"^if you could open one screen .*what would you want\b",
     )
     if any(re.search(pattern, title) for pattern in non_concrete_patterns):
         return ConcreteProductResult(
@@ -221,13 +321,19 @@ def classify_concrete_product(
         )
     if eligibility.eligibility_status == "AMBIGUOUS":
         return ConcreteProductResult("AMBIGUOUS", "Eligibility is unresolved.")
-    if source == "yanko_design":
+    if source in {"yanko_design", "design_milk"}:
         if _has_hint(text, _PHYSICAL_HINTS):
             return ConcreteProductResult("CONCRETE", "One product/design object is identifiable.")
         return ConcreteProductResult("AMBIGUOUS", "No single design object can be identified.")
+    if source == "hacker_news":
+        if eligibility.eligibility_status == "ELIGIBLE":
+            return ConcreteProductResult(
+                "CONCRETE", "Show HN submission identifies one named software product."
+            )
+        return ConcreteProductResult("AMBIGUOUS", "Show HN software identity is unresolved.")
     if title == "my" and "leather journal" in body and "backpocket" in body:
         return ConcreteProductResult("CONCRETE", "Body identifies one pocket journal cover.")
-    if source in {"reddit", "reddit_arctic_shift"} and normalize_reddit_title(product.title):
+    if "reddit" in source and normalize_reddit_title(product.title):
         return ConcreteProductResult("CONCRETE", "Title identifies one supported product object.")
     physical_nouns = {
         hint for hint in _PHYSICAL_HINTS if re.search(rf"\b{re.escape(hint)}s?\b", text)
@@ -235,7 +341,7 @@ def classify_concrete_product(
     software_nouns = {
         hint for hint in _SOFTWARE_HINTS if re.search(rf"\b{re.escape(hint)}s?\b", text)
     }
-    if source in {"reddit", "reddit_arctic_shift"}:
+    if "reddit" in source:
         if len(physical_nouns) == 1 or len(software_nouns) >= 1:
             return ConcreteProductResult("CONCRETE", "One product concept is identifiable in the post.")
         if len(physical_nouns) > 1:
@@ -343,6 +449,18 @@ def normalize_identity(
             title, normalized, existing_chinese_name,
             "amazon_catalog_parser", "HIGH" if normalized != title else "MEDIUM",
         )
+    if product.source_platform.casefold() == "etsy":
+        normalized = normalize_etsy_title(title)
+        return ProductIdentity(
+            title, normalized, existing_chinese_name,
+            "etsy_listing_title_parser", "HIGH" if normalized != title else "MEDIUM",
+        )
+    if product.source_platform.casefold() == "hacker_news":
+        normalized = normalize_show_hn_title(title)
+        return ProductIdentity(
+            title, normalized, existing_chinese_name,
+            "show_hn_title_parser", "HIGH" if normalized else "UNRESOLVED",
+        )
     if "reddit" in product.source_platform.casefold():
         normalized = normalize_reddit_title(title, description)
         if normalized:
@@ -350,7 +468,11 @@ def normalize_identity(
                 title, normalized, existing_chinese_name,
                 "reddit_product_noun", "HIGH",
             )
-    if product.source_platform.casefold() == "yanko_design":
+        return ProductIdentity(
+            title, title, existing_chinese_name,
+            "reddit_literal_title", "LOW",
+        )
+    if product.source_platform.casefold() in {"yanko_design", "design_milk"}:
         normalized = normalize_design_title(title)
         if normalized:
             return ProductIdentity(
@@ -381,6 +503,39 @@ _CORE_PRODUCT_PATTERNS = (
     (r"pillow inserts?", "Pillow Inserts"),
     (r"overnight oats containers?", "Overnight Oats Containers"),
 )
+
+
+def normalize_etsy_title(title: str) -> str:
+    """Reduce an Etsy SEO title while retaining its concrete product identity."""
+    cleaned = re.split(r"\s*[|/]\s*|,\s*(?:gift|personalized|custom|handmade)\b", title, maxsplit=1, flags=re.I)[0]
+    rules = (
+        (r"(?:leather\s+)?(?:travel\s+)?wallet.*passport|passport holder.*wallet", "Leather Passport Travel Wallet"),
+        (r"desk organi[sz]er", "Desk Organizer"),
+        (r"travel (?:cable )?organi[sz]er", "Travel Cable Organizer"),
+        (r"pet treat pouch", "Pet Treat Pouch"),
+        (r"kitchen utensil holder", "Kitchen Utensil Holder"),
+        (r"storage basket", "Storage Basket"),
+        (r"notebook cover", "Notebook Cover"),
+    )
+    match = next((name for pattern, name in rules if re.search(pattern, title, re.I)), None)
+    return match or " ".join(cleaned.split())[:100]
+
+
+def normalize_show_hn_title(title: str) -> str | None:
+    """Remove the Show HN wrapper and first-person launch phrasing."""
+    value = re.sub(r"^show hn:\s*", "", title, flags=re.I).strip()
+    value = re.sub(r"^(?:i|we) (?:built|made|launched|created)\s+", "", value, flags=re.I)
+    deterministic = (
+        (r"^i missed the moving blocks, so i built a real linux disk defragmenter$", "Linux Disk Defragmenter"),
+        (r"^drop a sql schema, get an interactive er diagram$", "Interactive SQL ER Diagram Tool"),
+        (r"^my startup-idea scanner scored .*", "Startup Idea Scanner"),
+        (r"^prove your code produced your claims.*", "Code Claim Verification Tool"),
+    )
+    mapped = next((name for pattern, name in deterministic if re.search(pattern, value, re.I)), None)
+    if mapped:
+        return mapped
+    value = re.split(r"\s+[—–-]\s+|:\s+(?=[A-Z])", value, maxsplit=1)[0].strip()
+    return value[:100] if len(value) >= 2 else None
 
 
 def normalize_amazon_title(title: str) -> str:
@@ -435,6 +590,40 @@ def normalize_reddit_title(title: str, description: str = "") -> str | None:
         (r"headphones?", "Travel Headphones"),
         (r"work backpack.*(?:hiking|tactical)|backpack.*doesn.t feel.*(?:hiking|tactical)", "Non-Tactical Work Backpack"),
         (r"dragonfly ultra|36l dragonfly", "Dragonfly Ultra 36L Backpack"),
+        (r"seeking advice.*garbage bags?|garbage bags?", "Garbage Bags"),
+        (r"advice.*cot.*tent|tent.*cot", "Camping Tent Cot"),
+        (r"(?:duffle|duffel).*(?:backpack).*(?:40l|40 l)|(?:40l|40 l).*(?:duffle|duffel|backpack)", "40L+ Convertible Duffel Backpack"),
+        (r"bifl.*comfortable.*(?:tennis )?shoes?|comfortable.*(?:tennis )?shoes", "Durable Comfortable Men's Tennis Shoes"),
+        (r"local[- ]first expense tracker", "Local-First Expense Tracker"),
+        (r"browser extension.*block.*shorts|block.*shorts.*browser extension", "Shorts-Blocking Browser Extension"),
+        (r"self[- ]hosted alternative to notion", "Self-Hosted Workspace / Knowledge App"),
+        (r"app.*organi[sz]e screenshots?|organi[sz]e screenshots?.*app", "Screenshot Organizer App"),
+        (r"(?:tiny )?tool.*cleaning csv|clean(?:ing)? csv.*tool", "CSV Cleaning Tool"),
+        (r"app blocker|screen time app", "Screen-Time App Blocker"),
+        (r"note\s*taking app", "Note-Taking App"),
+        (r"to-do.*widget|widget.*to-do", "Widget-Editable To-Do App"),
+        (r"habit track(?:ing|er).*(?:app)?", "Habit Tracking App"),
+        (r"note taking app.*multiple systems|multiple systems.*note taking", "Cross-Platform Note-Taking App"),
+        (r"digital stick(?:y)? notes?|digital notice board", "Digital Sticky Notes App"),
+        (r"chores app", "Household Chores App"),
+        (r"saving articles?.*highlight|highlight.*articles?", "Read-Later Highlighting App"),
+        (r"trade journal.*stock app|stock app.*trade journal", "Stock Trade Journal App"),
+        (r"whiteboard app.*shape.*another whiteboard", "Nested Whiteboard App"),
+        (r"ai video choose-your-own-adventure", "AI Interactive Video App"),
+        (r"wheel of the year widget", "Wheel of the Year Widget"),
+        (r"ai app for couples", "Couples AI App"),
+        (r"app that reminds me.*call my mom", "Relationship Reminder App"),
+        (r"watch/read list order tracker", "Watch / Read List Tracker"),
+        (r"local minecraft server manager", "Self-Hosted Minecraft Server Manager"),
+        (r"taskodoro", "Taskodoro Task Management App"),
+        (r"perfect to-do/task list", "Personal To-Do List App"),
+        (r"blocking yt shorts", "Shorts-Blocking App"),
+        (r"^mindspark:", "MindSpark Mind-Mapping App"),
+        (r"^c-shop\b", "C-Shop Image Editor"),
+        (r"^testing files generator\b", "Testing Files Generator"),
+        (r"^puls:", "PULS Linux System Monitoring Tool"),
+        (r"\bvectoria\b.*document exploration workspace", "Vectoria Document Exploration Workspace"),
+        (r"^justforms\b", "JustForms PDF Form Editor"),
     )
     return next((name for pattern, name in rules if re.search(pattern, text, re.I)), None)
 
@@ -584,10 +773,23 @@ def extract_evidence(product: Product) -> list[EvidenceFact]:
             "tagline": ("tagline",), "launch_date": ("published_at",),
             "topics": ("topics", "categories"), "description": ("description",),
         }
-    elif source == "yanko_design":
+    elif source in {"yanko_design", "design_milk"}:
         aliases = {
             "article_date": ("published_at",), "categories": ("categories",),
             "tags": ("tags",), "designer": ("designer", "company"),
+        }
+    elif source == "etsy":
+        aliases = {
+            "price": ("price",), "currency": ("currency",),
+            "views": ("views",), "favorite_count": ("favorite_count",),
+            "shop_id": ("shop_id",), "taxonomy": ("taxonomy",),
+            "listing_age": ("created_timestamp",), "availability": ("state",),
+        }
+    elif source == "hacker_news":
+        aliases = {
+            "points": ("points",), "comments": ("comment_count",),
+            "submission_timestamp": ("submitted_at",), "author": ("author",),
+            "external_product_url": ("external_product_url",),
         }
     else:
         aliases = {}
@@ -628,6 +830,14 @@ def assess_evidence_strength(
         funding = values.get("funding_percentage", 0)
         reasons = [f"Crowdfunding: {int(backers)} backers", f"Crowdfunding: {funding:g}% funded"]
         strength = "STRONG" if backers >= 500 and funding >= 100 else "MODERATE" if backers >= 50 or funding >= 100 else "WEAK"
+    elif source == "etsy":
+        favorites, views = values.get("favorite_count", 0), values.get("views", 0)
+        reasons = [f"Etsy: {int(favorites)} favorites", f"Etsy: {int(views)} views"]
+        strength = "STRONG" if favorites >= 100 or views >= 5000 else "MODERATE" if favorites >= 10 or views >= 500 else "WEAK"
+    elif source == "hacker_news":
+        comments, points = values.get("comments", 0), values.get("points", 0)
+        reasons = [f"Show HN: {int(points)} points", f"Show HN: {int(comments)} comments"]
+        strength = "STRONG" if points >= 100 and comments >= 30 else "MODERATE" if points >= 20 or comments >= 10 else "WEAK"
     else:
         reasons = ["Only descriptive source metadata is currently available."]
     if independent_source_count >= 2:

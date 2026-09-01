@@ -1272,3 +1272,80 @@ Completed
 - 部署DDL直接从当前`POSTGRES_SCHEMA`筛选Phase 11C六张表、additive concrete字段和对应index，避免第二套schema定义漂移。
 - schema部署与前后数据校验位于同一事务；验证Product总数、完整Product ID集合、Favorite行、Favorite Product IDs及三条Favorite raw_data hash完全不变，否则回滚。
 - 生成`schema_deployment_report.json`与post-deploy read-only audit artifact；部署完成后必须停止，不自动进入`reset_and_validate`。
+
+### Phase 11E - Evidence-First Source Expansion
+
+状态：Implemented and locally validated; not deployed
+
+- 新增Etsy官方Open API、Hacker News官方Firebase Show HN、软件类Reddit公共RSS和Design Milk公共RSS适配器；全部进入现有Evidence-First Observation路径，Daily Discovery不依赖Gemini资格。
+- Etsy环境已存在所需变量名，但真实官方API有界请求timeout；不打印凭据、不绕过访问控制。Design Milk FeedBurner timeout且直接feed返回403；软件Reddit RSS timeout。三个blocked来源均不阻塞其他来源。
+- Show HN真实有界Probe获取30条，并在临时SQLite完整验证：Observed 30、Eligible/Concrete/Daily Families 24；Physical 1、Software 23；Evidence Weak 16、Moderate 6、Strong 2。
+- 新增Etsy SEO标题压缩、Show HN标题去壳、Design Milk对象规则，以及Reddit四类明确单商品需求规范化；继续排除多商品比较、roundup、泛讨论与数字下载。
+- 全部适配器只保留源站真实字段；没有评论/评论文本时明确`user_feedback_available=false`，不生成虚假用户反馈。
+- 生产Neon、Favorite、UI、WxPusher均未修改；Gemini/WxPusher调用均为0；未commit、未push、未部署。
+- NEXT / LATER：GitHub product discovery、Core77 access probe、Designboom review；后续Today UI与WxPusher应共同读取同一持久化Daily Discovery Dataset，本阶段不切换。
+
+### Phase 11E.1 - Recover Software Reddit + Final Design Milk Probe
+
+状态：Completed locally; not deployed
+
+- 软件Reddit改为继承生产中已有的Arctic Shift传输，不再使用独立RSS网络栈；保留SideProject、selfhosted、opensource、productivity四个社区以及逐社区失败隔离。
+- Arctic Shift部分全文查询返回422时，复用同一公开endpoint进行有界无查询回退，再由现有意图与Concrete Gate过滤；受控样本Fetched/Observed 40、Eligible 36、Concrete 22、Daily Families 19。
+- 修复`[ Removed by moderator ]`变体、troubleshooting、megathread、宽泛推荐、泛讨论和模糊构想的确定性误收；无安全改写的Reddit标题保留原文并标记LOW confidence。
+- Etsy本阶段网络调用0，状态固定为`DEFERRED_PENDING_PERSONAL_APPROVAL`，不误报为认证或scope故障。
+- Design Milk最终合法Probe检查RSS、sitemap、category/tag feed与Latest：FeedBurner timeout，所有直接公开入口HTTP 403，最终状态`DEFERRED`，不绕过访问控制。
+- Show HN 10条回归中7条Concrete/Daily，source-native points/comments/URL保持；4个句子式标题完成确定性identity清理。
+- 生产Product/Favorite、UI、WxPusher均未修改；Gemini/WxPusher调用0；未commit、未push。
+# Phase 11F
+
+Status: Completed for review; production cutover disabled.
+
+- Added an additive, historical Daily Discovery snapshot model.
+- Today and complete WxPusher renderers share one persisted ordered dataset.
+- Membership is observation/run based and independent of AI, Top Picks, and score cutoffs.
+- Added Chinese-first factual cards, family Favorite, and soft Hide/Delete reasons.
+- Actual feedback requires traceable source text; missing feedback is stated explicitly.
+- Evidence ordering is deterministic: strength, freshness, then stable identity.
+- `EVIDENCE_FIRST_TODAY_ENABLED` remains false and live WxPusher sends remain disabled.
+- Etsy remains `DEFERRED_PENDING_PERSONAL_APPROVAL`; Design Milk remains `DEFERRED`.
+# Phase 11F.1
+
+Status: Production preview generated; cutover blocked pending Chinese coverage.
+
+- Audited production Neon read-only before the additive preview write.
+- Latest observation-bearing run `eea5767e43a747b1a49a6dc390656927` contains 182 active Daily Discovery families: 112 physical, 66 software, and 4 product-design families.
+- The earlier 159 count was from the local validation database, not production. The production change from 181 to 182 is one additional software family in the later production run.
+- Hacker News and Software Reddit are not present in this production run; their Phase 11E validation contribution remains local/code-only.
+- Added the two Phase 11F snapshot tables additively and persisted the production preview without changing Products or Favorites.
+- Dataset, Today, and complete WxPusher dry-run parity passed at 182/182/182 in identical order across 10 chunks. No live notification was sent.
+- Controlled post-membership Chinese enrichment produced no valid translations; all 182 items safely retained English fallback. UI cutover remains disabled until Chinese-first coverage is usable.
+- Review artifacts are generated under the ignored local `.phase11f-preview/` directory.
+# Phase 11F.2
+
+Status: Chinese enrichment recovery diagnosed; enrichment stopped at connectivity gate.
+
+- Confirmed Phase 11F.1 ran locally with a configured Gemini key and `gemini-3.5-flash-lite`; missing credentials were not the cause.
+- The original 20-item batch implementation swallowed per-batch exceptions, provided no durable diagnostic, and every batch approached the 65-second provider wall-clock limit.
+- A required one-call tiny translation probe did not produce a verifiable structured success result. Per the safety gate, the 20-item sample and full 182-item enrichment were not executed.
+- The later `psycopg.OperationalError` was a secondary snapshot reload failure after the translation attempts, not evidence that Daily Discovery membership failed; the persisted 182-item snapshot remains intact.
+- Added a versioned family enrichment cache keyed by an identity fingerprint, strict factual Chinese validation, conservative five-item batching, failure isolation, and cache invalidation support for a future controlled retry.
+- Production UI and complete WxPusher remain disabled; no live notification was sent.
+# Phase 11F.3
+
+Status: Resilient deterministic Chinese fallback validated; production cutover remains off pending user approval.
+
+- Implemented the display fallback stack: versioned family cache, conservative deterministic names, deterministic factual descriptions, optional Gemini, then English fallback.
+- Added a limited common-product vocabulary, safe brand/model preservation, phrase composition, software suffix handling, and explicit fallback for unknown identities.
+- Processed the fixed 182-family production preview without Gemini calls: 167 Chinese names and descriptions (91.8%), with 15 safe English fallbacks.
+- Persisted 167 fingerprint/version-scoped enrichment cache entries for reuse; translation never changed membership or display order.
+- Audited 40 records across Amazon, Kickstarter, Indiegogo, Product Hunt, Reddit, Yanko, physical and software content. No invented facts, opportunity language, or business verdicts were introduced; known brand/model prefix issues found during audit were corrected before final preview generation.
+- Regenerated Today and complete WxPusher previews. Dataset/Today/WxPusher remain 182/182/182 with identical family IDs and order across 10 chunks.
+- UI and WxPusher production cutover remain disabled; no live notification was sent.
+## Phase 11G
+
+Status: Completed
+
+- Evidence-First Today is the production default and reads only the persisted Daily Discovery snapshot.
+- The validated 182-family production snapshot was retained without recomputing membership.
+- Production WxPusher remains explicitly disabled pending separate manual approval.
+- Additive schema, Favorites, evidence, renderer parity, Chinese coverage, and Streamlit runtime were verified before cutover.

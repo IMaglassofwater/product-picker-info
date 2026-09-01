@@ -320,6 +320,12 @@ def execute_daily(
         error = "; ".join(errors)
         with query_profile(output, "pipeline_run_finalization"):
             db.finish_pipeline_run(run_id, status, error, stats=stats)
+        try:
+            from daily_discovery import build_daily_discovery
+            snapshot = build_daily_discovery(run_id)
+            stats["daily_discovery_count"] = snapshot["item_count"]
+        except Exception as exc:
+            output(f"WARNING: Daily Discovery snapshot unavailable ({type(exc).__name__})")
         return DailyRunResult(run_id, status, ai.pending, error, stats)
     finally:
         lock.release()
@@ -358,20 +364,21 @@ def main() -> int:
             f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
             f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
         )
-    try:
-        send_daily_notification(DailyNotificationSummary(
-            status=result.status,
-            new_products=int(result.stats.get("new_products", 0)),
-            ai_analyzed=int(triage.get("successful", 0)),
-            qualified=int(result.stats.get("qualified_count", 0)),
-            top_picks=top_picks,
-            failed_sources=source_failures,
-            failed_stage="Daily Pipeline" if result.status == "FAILED" else "",
-            error=result.error,
-            run_url=run_url,
-        ))
-    except Exception as exc:
-        print(f"WARNING: WxPusher notification failed ({type(exc).__name__})")
+    if os.getenv("EVIDENCE_FIRST_WXPUSHER_ENABLED", "false").lower() in {"1", "true", "yes"}:
+        try:
+            send_daily_notification(DailyNotificationSummary(
+                status=result.status,
+                new_products=int(result.stats.get("new_products", 0)),
+                ai_analyzed=int(triage.get("successful", 0)),
+                qualified=int(result.stats.get("qualified_count", 0)),
+                top_picks=top_picks,
+                failed_sources=source_failures,
+                failed_stage="Daily Pipeline" if result.status == "FAILED" else "",
+                error=result.error,
+                run_url=run_url,
+            ))
+        except Exception as exc:
+            print(f"WARNING: WxPusher notification failed ({type(exc).__name__})")
     print(f"Daily Product Picker: {result.status}")
     print(f"AI Pending: {result.ai_pending}")
     if result.error:

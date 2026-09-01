@@ -50,6 +50,7 @@ jobs:
           DAILY_SCHEDULE_ENABLED: ${{ vars.DAILY_SCHEDULE_ENABLED || 'false' }}
           PRODUCTION_DAILY: "true"
           MAX_DAILY_TRIAGE_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_daily_triage_calls || '30' }}
+          EVIDENCE_FIRST_WXPUSHER_ENABLED: "false"
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
         run: python run_daily.py

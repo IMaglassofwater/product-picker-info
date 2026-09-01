@@ -12,3 +12,4 @@ secrets.toml
 .streamlit/secrets.toml
 logs/*.log
 .pytest_cache/
+.phase11f-preview/

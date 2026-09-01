@@ -119,6 +119,7 @@ def test_connectivity_test_sends_only_fixed_message():
 
 
 def test_notification_failure_does_not_change_pipeline_exit(monkeypatch):
+    monkeypatch.setenv("EVIDENCE_FIRST_WXPUSHER_ENABLED", "true")
     result = run_daily.DailyRunResult("run-1", "SUCCESS", 0, "", {
         "new_products": 1, "qualified_count": 0, "top_picks": [],
         "triage": {"successful": 0}, "sources": [],
@@ -127,5 +128,19 @@ def test_notification_failure_does_not_change_pipeline_exit(monkeypatch):
     monkeypatch.setattr(
         run_daily, "send_daily_notification",
         lambda _summary: (_ for _ in ()).throw(RuntimeError("notification unavailable")),
+    )
+    assert run_daily.main() == 0
+
+
+def test_production_notification_is_disabled_by_default(monkeypatch):
+    result = run_daily.DailyRunResult("run-1", "SUCCESS", 0, "", {
+        "new_products": 1, "qualified_count": 0, "top_picks": [],
+        "triage": {"successful": 0}, "sources": [],
+    })
+    monkeypatch.delenv("EVIDENCE_FIRST_WXPUSHER_ENABLED", raising=False)
+    monkeypatch.setattr(run_daily, "execute_daily", lambda: result)
+    monkeypatch.setattr(
+        run_daily, "send_daily_notification",
+        lambda _summary: (_ for _ in ()).throw(AssertionError("live send")),
     )
     assert run_daily.main() == 0

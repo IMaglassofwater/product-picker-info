@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import logging
+import os
 
 import streamlit as st
 
@@ -35,6 +36,7 @@ from dashboard_data import (
 from daily_ranker import load_current_opportunities, select_daily_top, select_full_qualified
 from product_display import build_product_display, chinese_ai_content
 import db
+from daily_discovery import filter_today_items, load_daily_discovery, today_renderer_items
 
 
 st.set_page_config(page_title="Product Picker", page_icon="🧭", layout="wide")
@@ -297,6 +299,67 @@ def today_page(snapshot) -> None:
             product_card(product, "today-more", final_score=item.final_rank_score, compact=False)
 
 
+def evidence_first_today_page() -> None:
+    """Chinese-first view over the persisted dataset; never recalculates membership."""
+    dataset = load_daily_discovery()
+    st.header("今日发现")
+    if not dataset:
+        st.info("今天的 Evidence-First 数据集尚未生成。")
+        return
+    all_items = today_renderer_items(dataset)
+    type_counts = {kind: sum(str(item.get("product_type", "")).upper() == kind for item in all_items)
+                   for kind in ("PHYSICAL_PRODUCT", "SOFTWARE_PRODUCT", "PRODUCT_DESIGN")}
+    evidence_counts = {level: sum(item.get("evidence_strength") == level for item in all_items)
+                       for level in ("STRONG", "MODERATE", "WEAK")}
+    st.subheader(f"今天发现 {len(all_items)} 个产品")
+    st.caption(
+        f"实物 {type_counts['PHYSICAL_PRODUCT']} · 软件 {type_counts['SOFTWARE_PRODUCT']} · 设计 {type_counts['PRODUCT_DESIGN']}  |  "
+        f"Strong {evidence_counts['STRONG']} · Moderate {evidence_counts['MODERATE']} · Weak {evidence_counts['WEAK']}"
+    )
+    c1, c2, c3 = st.columns(3)
+    product_type = c1.selectbox("产品类型", ("ALL", "PHYSICAL_PRODUCT", "SOFTWARE_PRODUCT", "PRODUCT_DESIGN"), key="ef-type")
+    evidence = c2.selectbox("证据强度", ("ALL", "STRONG", "MODERATE", "WEAK"), key="ef-evidence")
+    sources = sorted({source for item in all_items for source in item.get("source_platforms", [])})
+    source = c3.selectbox("来源", ("ALL", *sources), key="ef-source")
+    items = filter_today_items(all_items, product_type=product_type, evidence=evidence, source=source)
+    st.caption(f"当前视图 {len(items)} / 完整数据集 {len(all_items)}")
+    for item in items:
+        try:
+            with st.container(border=True):
+                st.subheader(item.get("canonical_name_zh") or item["canonical_name"])
+                st.caption(f"English / Original: {item['canonical_name']}")
+                st.write(item.get("factual_description_zh") or "暂无事实描述")
+                st.write(f"类型：{item.get('product_type')} · Evidence: {item.get('evidence_strength')}")
+                st.markdown("**市场信号**")
+                for reason in item.get("evidence_reasons", []):
+                    st.write(f"- {reason}")
+                st.markdown("**用户反馈**")
+                if item.get("actual_feedback"):
+                    for value in item["actual_feedback"][:3]:
+                        st.write(f"- {value['text']} ({value['source_platform']})")
+                else:
+                    st.write("暂无可用的用户文字反馈")
+                links = [value for value in item.get("source_records", []) if value.get("url")]
+                for number, value in enumerate(links):
+                    st.link_button(f"查看来源：{value.get('source_platform')}", value["url"], key=f"ef-link-{item['family_id']}-{number}")
+                a, b = st.columns(2)
+                if a.button("⭐ 收藏", key=f"ef-favorite-{item['family_id']}"):
+                    db.save_family_feedback(item["family_id"], "FAVORITE")
+                    st.toast("已收藏")
+                with b.popover("🗑 删除 / 隐藏"):
+                    reason = st.selectbox("原因", ("不感兴趣", "不适合我卖", "太普通", "成本/物流可能不合适", "太复杂", "已经看过类似产品", "其他"), key=f"ef-reason-{item['family_id']}")
+                    note = st.text_input("补充说明（可选）", key=f"ef-note-{item['family_id']}")
+                    if st.button("确认隐藏", key=f"ef-hide-{item['family_id']}"):
+                        db.save_family_feedback(item["family_id"], "HIDDEN", reason, note)
+                        st.rerun()
+                with st.expander("English / Original details"):
+                    st.write(item.get("factual_description") or "No factual description available.")
+                    st.write([value.get("source_title") for value in item.get("source_records", [])])
+        except Exception:
+            LOGGER.exception("Evidence-first card render failed for family_id=%s", item.get("family_id"))
+            st.warning(f"无法显示该产品卡片：{item.get('canonical_name', 'unknown')}")
+
+
 def all_products_page(snapshot) -> None:
     st.header("全部历史产品 · All Historical Products")
     st.metric("数据库记录 · Database Records", len(snapshot.products))
@@ -378,7 +441,10 @@ selected_page = st.radio(
     label_visibility="collapsed",
 )
 if selected_page == NAVIGATION_TABS[0]:
-    today_page(snapshot)
+    if os.getenv("EVIDENCE_FIRST_TODAY_ENABLED", "true").lower() in {"1", "true", "yes"}:
+        evidence_first_today_page()
+    else:
+        today_page(snapshot)
 elif selected_page == NAVIGATION_TABS[1]:
     all_products_page(snapshot)
 elif selected_page == NAVIGATION_TABS[2]:

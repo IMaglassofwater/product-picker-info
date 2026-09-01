@@ -206,6 +206,9 @@ class ArcticShiftScraper(BaseScraper):
         invalid_markers = {"[removed]", "[deleted]", "removed", "deleted"}
         if title.lower() in invalid_markers or selftext.lower() in invalid_markers:
             return False
+        normalized_title = " ".join(title.casefold().replace("[", " ").replace("]", " ").split())
+        if normalized_title in {"removed by moderator", "removed by reddit", "deleted by user"}:
+            return False
         if not title and not selftext:
             return False
         url = str(record.get("url") or "").lower().split("?", 1)[0]

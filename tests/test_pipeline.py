@@ -133,6 +133,38 @@ def test_arctic_shift_failure_does_not_stop_other_sources(tmp_path, monkeypatch)
     assert "Saved:\n2" in output
 
 
+def test_phase11e_source_failure_does_not_stop_other_new_sources(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "product_picker.db")
+    messages: list[str] = []
+    scrapers = [
+        _FailingScraper("etsy"),
+        _MockScraper(
+            "hacker_news",
+            [_product("hacker_news", 1, title="Show HN: TidyCSV tool")],
+        ),
+    ]
+    assert main.run_pipeline(scrapers=scrapers, output=messages.append) is True
+    output = "\n".join(messages)
+    assert "etsy mock failure" in output
+    assert "Total processed:\n1" in output
+    assert db.get_all_products()[0].source_platform == "hacker_news"
+
+
+def test_deferred_design_milk_does_not_block_software_reddit(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "product_picker.db")
+    messages: list[str] = []
+    scrapers = [
+        _FailingScraper("design_milk"),
+        _MockScraper(
+            "reddit_software",
+            [_product("reddit_software", 1, title="Local-first expense tracker app")],
+        ),
+    ]
+    assert main.run_pipeline(scrapers=scrapers, output=messages.append) is True
+    assert "design_milk mock failure" in "\n".join(messages)
+    assert db.get_all_products()[0].source_platform == "reddit_software"
+
+
 def test_max_items_per_source_is_enforced(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "product_picker.db")
     messages: list[str] = []
@@ -383,8 +415,9 @@ def test_amazon_failure_is_optional_and_does_not_fail_pipeline(tmp_path, monkeyp
     assert "Pipeline continued without Amazon." in "\n".join(messages)
 
 
-def test_six_core_sources_are_in_default_pipeline():
+def test_core_and_phase_11e_sources_are_in_default_pipeline():
     assert {scraper.source_name for scraper in main.SCRAPERS} == {
         "reddit_arctic_shift", "amazon", "kickstarter", "indiegogo",
-        "yanko_design", "product_hunt",
+        "yanko_design", "product_hunt", "etsy", "hacker_news",
+        "reddit_software", "design_milk",
     }

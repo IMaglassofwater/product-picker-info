@@ -30,7 +30,7 @@ class ProductionSelection:
 
 REAL_SOURCES = {
     "reddit", "reddit_arctic_shift", "amazon", "kickstarter",
-    "indiegogo", "product_hunt", "yanko_design",
+    "indiegogo", "product_hunt", "yanko_design", "reddit_software", "hacker_news",
 }
 
 
@@ -159,6 +159,16 @@ def _production_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3.R
             f"SELECT e.* FROM source_evidence_snapshots e JOIN products p ON p.id=e.product_id "
             f"WHERE lower(p.source_platform) IN ({placeholders})", sources,
         ),
+        "daily_discovery_runs": (
+            "SELECT d.* FROM daily_discovery_runs d WHERE EXISTS "
+            "(SELECT 1 FROM pipeline_runs r WHERE r.run_id=d.pipeline_run_id)", (),
+        ),
+        "daily_discovery_items": (
+            "SELECT i.* FROM daily_discovery_items i JOIN daily_discovery_runs d ON d.run_id=i.daily_run_id", (),
+        ),
+        "product_family_enrichments": (
+            "SELECT e.* FROM product_family_enrichments e JOIN product_families f ON f.id=e.family_id", (),
+        ),
     }
     return {table: connection.execute(sql, params).fetchall() for table, (sql, params) in queries.items()}
 
@@ -196,7 +206,7 @@ def execute_production_migration(source: Path, database_url: str) -> dict[str, i
             "product_metric_snapshots", "pipeline_source_runs", "specificity_results",
             "user_product_feedback", "re_evaluation_requests",
             "product_families", "product_family_members", "product_observations",
-            "source_evidence_snapshots",
+            "source_evidence_snapshots", "daily_discovery_items",
         }
         for table in identity_tables:
             if copied.get(table):

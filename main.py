@@ -33,6 +33,10 @@ from scrapers.kickstarter import KickstarterScraper
 from scrapers.indiegogo import IndiegogoScraper
 from scrapers.product_hunt import ProductHuntScraper
 from scrapers.yanko_design import YankoDesignScraper
+from scrapers.etsy import EtsyScraper
+from scrapers.hacker_news import HackerNewsScraper
+from scrapers.software_reddit import SoftwareRedditScraper
+from scrapers.design_milk import DesignMilkScraper
 
 
 SEPARATOR = "=" * 23
@@ -44,6 +48,10 @@ MAX_ITEMS_PER_SOURCE = {
     "amazon": 30,
     "yanko_design": 50,
     "indiegogo": 100,
+    "etsy": 48,
+    "hacker_news": 75,
+    "reddit_software": 100,
+    "design_milk": 30,
 }
 SOURCE_LABELS = {
     "product_hunt": "Product Hunt",
@@ -52,6 +60,10 @@ SOURCE_LABELS = {
     "amazon": "Amazon",
     "yanko_design": "Yanko Design",
     "indiegogo": "Indiegogo",
+    "etsy": "Etsy",
+    "hacker_news": "Hacker News / Show HN",
+    "reddit_software": "Software Reddit",
+    "design_milk": "Design Milk",
 }
 SCRAPERS: list[BaseScraper] = [
     ProductHuntScraper(),
@@ -60,6 +72,10 @@ SCRAPERS: list[BaseScraper] = [
     AmazonTrendScraper(),
     YankoDesignScraper(),
     IndiegogoScraper(),
+    EtsyScraper(),
+    HackerNewsScraper(),
+    SoftwareRedditScraper(),
+    DesignMilkScraper(),
 ]
 
 
@@ -400,6 +416,13 @@ def run_pipeline(
             run_id,
             "PARTIAL" if any(s["failed"] for s in source_stats.values()) else "COMPLETED",
         )
+        # Additive Phase 11F snapshot only. Legacy UI and notification delivery
+        # remain independently guarded until the reviewed production cutover.
+        try:
+            from daily_discovery import build_daily_discovery
+            build_daily_discovery(run_id)
+        except Exception as exc:
+            output(f"WARNING: Daily Discovery snapshot unavailable ({type(exc).__name__})")
     candidate_score_distribution = {
         "90-100": sum(90 <= item.candidate_score <= 100 for item in candidates),
         "80-89": sum(80 <= item.candidate_score <= 89 for item in candidates),

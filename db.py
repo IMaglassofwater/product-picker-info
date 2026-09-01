@@ -335,9 +335,53 @@ def init_db() -> bool:
                     FOREIGN KEY(pipeline_run_id) REFERENCES pipeline_runs(run_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS daily_discovery_runs (
+                    run_id TEXT PRIMARY KEY,
+                    pipeline_run_id TEXT NOT NULL UNIQUE,
+                    discovery_date TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    item_count INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(pipeline_run_id) REFERENCES pipeline_runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS daily_discovery_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    daily_run_id TEXT NOT NULL,
+                    family_id INTEGER NOT NULL,
+                    display_order INTEGER NOT NULL,
+                    canonical_name TEXT NOT NULL,
+                    canonical_name_zh TEXT,
+                    product_type TEXT NOT NULL,
+                    evidence_strength TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(daily_run_id, family_id),
+                    UNIQUE(daily_run_id, display_order),
+                    FOREIGN KEY(daily_run_id) REFERENCES daily_discovery_runs(run_id),
+                    FOREIGN KEY(family_id) REFERENCES product_families(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS product_family_enrichments (
+                    family_id INTEGER PRIMARY KEY,
+                    identity_fingerprint TEXT NOT NULL,
+                    canonical_name_en TEXT NOT NULL,
+                    canonical_name_zh TEXT NOT NULL,
+                    factual_description_zh TEXT NOT NULL,
+                    enrichment_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_type TEXT NOT NULL DEFAULT '',
+                    generated_at TEXT NOT NULL,
+                    FOREIGN KEY(family_id) REFERENCES product_families(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_observations_run ON product_observations(pipeline_run_id);
                 CREATE INDEX IF NOT EXISTS idx_family_members_family ON product_family_members(family_id);
                 CREATE INDEX IF NOT EXISTS idx_evidence_product ON source_evidence_snapshots(product_id);
+                CREATE INDEX IF NOT EXISTS idx_daily_discovery_date ON daily_discovery_runs(discovery_date);
+                CREATE INDEX IF NOT EXISTS idx_daily_discovery_items_run ON daily_discovery_items(daily_run_id, display_order);
+                CREATE INDEX IF NOT EXISTS idx_family_enrichment_fingerprint ON product_family_enrichments(identity_fingerprint);
                 """
             )
             _ensure_filter_columns(connection)
@@ -1110,8 +1154,8 @@ def save_specificity_results(
 def save_user_feedback(
     entity_type: str, entity_id: str, feedback_type: str, note: str = ""
 ) -> bool:
-    if entity_type not in {"product", "candidate"} or feedback_type not in {
-        "FAVORITE", "WATCH", "NOT_INTERESTED",
+    if entity_type not in {"product", "candidate", "family"} or feedback_type not in {
+        "FAVORITE", "WATCH", "NOT_INTERESTED", "HIDDEN", "DISMISSED",
     }:
         return False
     now = _utc_now()
@@ -1453,14 +1497,15 @@ def get_daily_discovery(run_id: str | None = None) -> list[dict]:
             rows = connection.execute(
                 """SELECT f.id AS family_id, f.canonical_name, f.canonical_name_zh,
                           f.primary_category, f.product_type, f.first_seen_at,
-                          f.last_seen_at, COUNT(DISTINCT p.source_platform) AS source_count
+                          f.last_seen_at, MAX(o.observed_at) AS latest_observed_at,
+                          COUNT(DISTINCT p.source_platform) AS source_count
                    FROM product_observations o
                    JOIN products p ON p.id=o.product_id
                    JOIN product_eligibility e ON e.product_id=p.id
                    JOIN product_family_members fm ON fm.product_id=p.id
                    JOIN product_families f ON f.id=fm.family_id
                    WHERE o.pipeline_run_id=? AND e.eligibility_status='ELIGIBLE'
-                     AND e.concrete_product_status='CONCRETE'
+                     AND e.concrete_product_status='CONCRETE' AND f.status='ACTIVE'
                    GROUP BY f.id, f.canonical_name, f.canonical_name_zh,
                             f.primary_category, f.product_type,
                             f.first_seen_at, f.last_seen_at
@@ -1471,13 +1516,15 @@ def get_daily_discovery(run_id: str | None = None) -> list[dict]:
                 item = dict(row)
                 sources = connection.execute(
                     """SELECT DISTINCT p.source_platform, p.url, p.id AS product_id,
-                                      p.description
+                                      p.title AS source_title, p.category, p.description, p.raw_data
                        FROM product_observations o JOIN products p ON p.id=o.product_id
                        JOIN product_family_members fm ON fm.product_id=p.id
                        WHERE o.pipeline_run_id=? AND fm.family_id=?
                        ORDER BY p.source_platform, p.id""", (run_id, item["family_id"]),
                 ).fetchall()
                 item["source_records"] = [dict(source) for source in sources]
+                for source in item["source_records"]:
+                    source["raw_data"] = _decode_json(source.get("raw_data"), {})
                 item["source_platforms"] = sorted({source["source_platform"] for source in sources})
                 descriptions = [
                     " ".join(str(source.get("description") or "").split())
@@ -1510,11 +1557,169 @@ def get_daily_discovery(run_id: str | None = None) -> list[dict]:
                 item["evidence_reasons"] = strongest.reasons if strongest else [
                     "No source-native market metrics are currently available."
                 ]
+                item["evidence_facts"] = [dict(value) for value in evidence_rows]
                 item["latest_run_id"] = run_id
                 output.append(item)
         return output
     except Exception:
         return []
+
+
+def persist_daily_discovery_snapshot(
+    pipeline_run_id: str, items: list[dict], *, discovery_date: str, metadata: dict | None = None
+) -> str | None:
+    """Atomically persist the authoritative ordered snapshot for one pipeline run."""
+    daily_run_id = f"daily:{pipeline_run_id}"
+    now = _utc_now()
+    try:
+        with _connect() as connection:
+            connection.execute(
+                """INSERT INTO daily_discovery_runs
+                   (run_id,pipeline_run_id,discovery_date,generated_at,status,item_count,metadata_json)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(pipeline_run_id) DO UPDATE SET
+                    discovery_date=excluded.discovery_date, generated_at=excluded.generated_at,
+                    status=excluded.status, item_count=excluded.item_count,
+                    metadata_json=excluded.metadata_json""",
+                (daily_run_id, pipeline_run_id, discovery_date, now, "COMPLETED", len(items),
+                 json.dumps(metadata or {}, ensure_ascii=False)),
+            )
+            connection.execute("DELETE FROM daily_discovery_items WHERE daily_run_id=?", (daily_run_id,))
+            for position, item in enumerate(items, 1):
+                snapshot = dict(item)
+                snapshot["display_order"] = position
+                connection.execute(
+                    """INSERT INTO daily_discovery_items
+                       (daily_run_id,family_id,display_order,canonical_name,canonical_name_zh,
+                        product_type,evidence_strength,snapshot_json,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (daily_run_id, item["family_id"], position, item["canonical_name"],
+                     item.get("canonical_name_zh"), item.get("product_type", "unknown"),
+                     item.get("evidence_strength", "WEAK"),
+                     json.dumps(snapshot, ensure_ascii=False, default=str), now),
+                )
+        return daily_run_id
+    except (KeyError, TypeError, sqlite3.Error):
+        return None
+
+
+def get_persisted_daily_discovery(
+    *, daily_run_id: str | None = None, pipeline_run_id: str | None = None
+) -> dict | None:
+    """Load one immutable daily snapshot, latest completed when no identity is supplied."""
+    try:
+        with _connect() as connection:
+            if daily_run_id:
+                row = connection.execute("SELECT * FROM daily_discovery_runs WHERE run_id=?", (daily_run_id,)).fetchone()
+            elif pipeline_run_id:
+                row = connection.execute("SELECT * FROM daily_discovery_runs WHERE pipeline_run_id=?", (pipeline_run_id,)).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM daily_discovery_runs WHERE status='COMPLETED' ORDER BY generated_at DESC, run_id DESC LIMIT 1"
+                ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["metadata"] = _decode_json(result.pop("metadata_json", "{}"), {})
+            item_rows = connection.execute(
+                "SELECT snapshot_json FROM daily_discovery_items WHERE daily_run_id=? ORDER BY display_order", (result["run_id"],)
+            ).fetchall()
+            result["items"] = [_decode_json(value["snapshot_json"], {}) for value in item_rows]
+            return result
+    except sqlite3.Error:
+        return None
+
+
+def update_daily_discovery_item_language(
+    daily_run_id: str, family_id: int, canonical_name_zh: str, factual_description_zh: str
+) -> bool:
+    """Update presentation language only; membership and display order are immutable."""
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json FROM daily_discovery_items WHERE daily_run_id=? AND family_id=?",
+                (daily_run_id, family_id),
+            ).fetchone()
+            if not row:
+                return False
+            snapshot = _decode_json(row["snapshot_json"], {})
+            snapshot["canonical_name_zh"] = canonical_name_zh
+            snapshot["factual_description_zh"] = factual_description_zh
+            cursor = connection.execute(
+                """UPDATE daily_discovery_items
+                   SET canonical_name_zh=?, snapshot_json=?
+                   WHERE daily_run_id=? AND family_id=?""",
+                (canonical_name_zh, json.dumps(snapshot, ensure_ascii=False, default=str), daily_run_id, family_id),
+            )
+        return cursor.rowcount == 1
+    except (TypeError, sqlite3.Error):
+        return False
+
+
+def get_family_enrichment(
+    family_id: int, identity_fingerprint: str, enrichment_version: str | None = None
+) -> dict | None:
+    try:
+        with _connect() as connection:
+            if enrichment_version:
+                row = connection.execute(
+                    """SELECT * FROM product_family_enrichments
+                       WHERE family_id=? AND identity_fingerprint=?
+                         AND enrichment_version=? AND status='COMPLETED'""",
+                    (family_id, identity_fingerprint, enrichment_version),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """SELECT * FROM product_family_enrichments
+                       WHERE family_id=? AND identity_fingerprint=? AND status='COMPLETED'""",
+                    (family_id, identity_fingerprint),
+                ).fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error:
+        return None
+
+
+def save_family_enrichment(
+    family_id: int, identity_fingerprint: str, canonical_name_en: str,
+    canonical_name_zh: str, factual_description_zh: str,
+    *, enrichment_version: str,
+) -> bool:
+    try:
+        with _connect() as connection:
+            connection.execute(
+                """INSERT INTO product_family_enrichments
+                   (family_id,identity_fingerprint,canonical_name_en,canonical_name_zh,
+                    factual_description_zh,enrichment_version,status,error_type,generated_at)
+                   VALUES (?,?,?,?,?,?, 'COMPLETED','',?)
+                   ON CONFLICT(family_id) DO UPDATE SET
+                    identity_fingerprint=excluded.identity_fingerprint,
+                    canonical_name_en=excluded.canonical_name_en,
+                    canonical_name_zh=excluded.canonical_name_zh,
+                    factual_description_zh=excluded.factual_description_zh,
+                    enrichment_version=excluded.enrichment_version,
+                    status='COMPLETED', error_type='', generated_at=excluded.generated_at""",
+                (family_id, identity_fingerprint, canonical_name_en, canonical_name_zh,
+                 factual_description_zh, enrichment_version, _utc_now()),
+            )
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def save_family_feedback(family_id: int, feedback_type: str, reason: str = "", note: str = "") -> bool:
+    payload = json.dumps({"reason": reason, "note": note}, ensure_ascii=False)
+    return save_user_feedback("family", str(family_id), feedback_type, payload)
+
+
+def get_family_feedback_map() -> dict[int, dict]:
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT entity_id,feedback_type,note,updated_at FROM user_product_feedback WHERE entity_type='family'"
+            ).fetchall()
+        return {int(row["entity_id"]): {**dict(row), "details": _decode_json(row["note"], {})} for row in rows}
+    except (ValueError, sqlite3.Error):
+        return {}
 
 
 def get_shadow_counts() -> dict[str, int]:
