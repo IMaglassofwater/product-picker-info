@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from html import escape
 import os
 import sys
+from hashlib import sha256
 from typing import Callable
 
 import requests
@@ -163,6 +164,48 @@ def send_connectivity_test(*, notifier: WxPusherNotifier | None = None) -> bool:
         "Product Picker 微信通知测试",
         "<p>Product Picker 微信自动通知连接正常 ✅</p>",
     )
+
+
+def notification_delivery_key(daily_run_id: str, uid: str, channel: str = "wxpusher") -> tuple[str, str]:
+    """Return non-secret stable delivery and recipient identities."""
+    recipient_hash = sha256(uid.encode("utf-8")).hexdigest()
+    key = sha256(f"{daily_run_id}|{channel}|{recipient_hash}".encode("utf-8")).hexdigest()
+    return key, recipient_hash
+
+
+def send_full_fidelity_daily(
+    dataset: dict, *, notifier: WxPusherNotifier | None = None,
+    is_delivered: Callable[[str], bool] = lambda _key: False,
+    record_delivery: Callable[[str, str, str, int, int], None] = lambda *_args: None,
+    max_chars: int = 39000,
+) -> bool:
+    """Fail closed on persistence/parity and mark complete only after every chunk."""
+    from daily_direction_report import render_wxpusher_messages, validate_web_wxpusher_parity
+
+    sender = notifier or WxPusherNotifier.from_env()
+    run_id = str(dataset.get("run_id") or dataset.get("daily_discovery_run_id") or "")
+    if not run_id or not dataset.get("items") or not sender.configured:
+        return False
+    try:
+        messages = render_wxpusher_messages(dataset, max_chars=max_chars)
+    except ValueError as exc:
+        sender._warning(f"WARNING: WxPusher full-fidelity report not sent ({exc})")
+        return False
+    parity = validate_web_wxpusher_parity(dataset, messages)
+    if not parity["overall"]:
+        return False
+    delivery_key, recipient_hash = notification_delivery_key(run_id, sender.uid)
+    if is_delivered(delivery_key):
+        return True
+    delivered = 0
+    record_delivery(delivery_key, run_id, recipient_hash, len(messages), delivered)
+    for message in messages:
+        if not sender.send(f"今日产品发现 {message['message_index']}/{message['total_messages']}", message["content"]):
+            record_delivery(delivery_key, run_id, recipient_hash, len(messages), delivered)
+            return False
+        delivered += 1
+        record_delivery(delivery_key, run_id, recipient_hash, len(messages), delivered)
+    return delivered == len(messages)
 
 
 def main(argv: list[str] | None = None) -> int:

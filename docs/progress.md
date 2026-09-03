@@ -1349,3 +1349,11 @@ Status: Completed
 - The validated 182-family production snapshot was retained without recomputing membership.
 - Production WxPusher remains explicitly disabled pending separate manual approval.
 - Additive schema, Favorites, evidence, renderer parity, Chinese coverage, and Streamlit runtime were verified before cutover.
+## Phase 11H
+
+Status: Preview completed
+
+- Added persisted deterministic Daily Picks derived from the complete Daily Discovery snapshot.
+- Added additive, traceable real User Voice storage with strict no-inference rules.
+- Added Today and WxPusher dry-run renderers sharing identical Picks IDs and order.
+- Production UI and production WxPusher remain unchanged pending manual review.

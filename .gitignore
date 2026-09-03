@@ -13,3 +13,5 @@ secrets.toml
 logs/*.log
 .pytest_cache/
 .phase11f-preview/
+.phase11h-preview/
+.phase11i-preview/

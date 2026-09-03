@@ -376,12 +376,77 @@ def init_db() -> bool:
                     FOREIGN KEY(family_id) REFERENCES product_families(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS daily_picks_runs (
+                    run_id TEXT PRIMARY KEY,
+                    daily_discovery_run_id TEXT NOT NULL UNIQUE,
+                    generated_at TEXT NOT NULL,
+                    target_count INTEGER NOT NULL,
+                    item_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(daily_discovery_run_id) REFERENCES daily_discovery_runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS product_directions (
+                    direction_id TEXT PRIMARY KEY, direction_key TEXT NOT NULL UNIQUE,
+                    name_en TEXT NOT NULL, name_zh TEXT NOT NULL, description_zh TEXT NOT NULL,
+                    direction_type TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS product_direction_members (
+                    direction_id TEXT NOT NULL, family_id INTEGER NOT NULL,
+                    match_reason TEXT NOT NULL, match_confidence TEXT NOT NULL, created_at TEXT NOT NULL,
+                    PRIMARY KEY(direction_id, family_id),
+                    FOREIGN KEY(direction_id) REFERENCES product_directions(direction_id),
+                    FOREIGN KEY(family_id) REFERENCES product_families(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS daily_picks_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    picks_run_id TEXT NOT NULL,
+                    family_id INTEGER NOT NULL,
+                    pick_order INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(picks_run_id, family_id),
+                    UNIQUE(picks_run_id, pick_order),
+                    FOREIGN KEY(picks_run_id) REFERENCES daily_picks_runs(run_id),
+                    FOREIGN KEY(family_id) REFERENCES product_families(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS user_voice_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_family_id INTEGER NOT NULL,
+                    product_id INTEGER,
+                    source TEXT NOT NULL,
+                    source_item_id TEXT,
+                    author TEXT,
+                    original_text TEXT NOT NULL,
+                    original_language TEXT NOT NULL DEFAULT 'unknown',
+                    source_url TEXT NOT NULL,
+                    published_at TEXT,
+                    engagement_json TEXT NOT NULL DEFAULT '{}',
+                    retrieved_at TEXT NOT NULL,
+                    voice_type TEXT NOT NULL DEFAULT 'OTHER_DISCUSSION',
+                    identity_key TEXT NOT NULL UNIQUE,
+                    FOREIGN KEY(product_family_id) REFERENCES product_families(id),
+                    FOREIGN KEY(product_id) REFERENCES products(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS notification_deliveries (
+                    delivery_key TEXT PRIMARY KEY, daily_run_id TEXT NOT NULL, channel TEXT NOT NULL,
+                    recipient_hash TEXT NOT NULL, status TEXT NOT NULL, chunk_count INTEGER NOT NULL,
+                    delivered_chunks INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_observations_run ON product_observations(pipeline_run_id);
                 CREATE INDEX IF NOT EXISTS idx_family_members_family ON product_family_members(family_id);
                 CREATE INDEX IF NOT EXISTS idx_evidence_product ON source_evidence_snapshots(product_id);
                 CREATE INDEX IF NOT EXISTS idx_daily_discovery_date ON daily_discovery_runs(discovery_date);
                 CREATE INDEX IF NOT EXISTS idx_daily_discovery_items_run ON daily_discovery_items(daily_run_id, display_order);
                 CREATE INDEX IF NOT EXISTS idx_family_enrichment_fingerprint ON product_family_enrichments(identity_fingerprint);
+                CREATE INDEX IF NOT EXISTS idx_daily_picks_items_run ON daily_picks_items(picks_run_id, pick_order);
+                CREATE INDEX IF NOT EXISTS idx_user_voice_family ON user_voice_items(product_family_id);
                 """
             )
             _ensure_filter_columns(connection)
@@ -390,9 +455,26 @@ def init_db() -> bool:
             _ensure_triage_bilingual_columns(connection)
             _ensure_pipeline_stats_column(connection)
             _ensure_shadow_columns(connection)
+            _ensure_direction_columns(connection)
         return True
     except (OSError, sqlite3.Error):
         return False
+
+
+def _ensure_direction_columns(connection: sqlite3.Connection) -> None:
+    """Add full-fidelity Daily Direction columns without rewriting history."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(daily_picks_items)")}
+    if "direction_id" not in columns:
+        connection.execute("ALTER TABLE daily_picks_items ADD COLUMN direction_id TEXT")
+    voice_columns = {row["name"] for row in connection.execute("PRAGMA table_info(user_voice_items)")}
+    additions = {"product_direction_id":"TEXT", "translated_text_zh":"TEXT", "score_or_likes":"TEXT",
+        "source_post_id":"TEXT", "source_comment_id":"TEXT", "parent_feedback_id":"TEXT",
+        "retrieval_method":"TEXT", "traceable":"INTEGER NOT NULL DEFAULT 1",
+        "is_platform_ai_summary":"INTEGER NOT NULL DEFAULT 0", "content_hash":"TEXT",
+        "metadata_json":"TEXT NOT NULL DEFAULT '{}'"}
+    for name, definition in additions.items():
+        if name not in voice_columns:
+            connection.execute(f"ALTER TABLE user_voice_items ADD COLUMN {name} {definition}")
 
 
 def _ensure_filter_columns(connection: sqlite3.Connection) -> None:
@@ -1654,6 +1736,148 @@ def update_daily_discovery_item_language(
         return cursor.rowcount == 1
     except (TypeError, sqlite3.Error):
         return False
+
+
+def persist_daily_picks_snapshot(daily_discovery_run_id: str, items: list[dict], target_count: int = 20) -> str:
+    """Persist one deterministic Picks projection without changing Discovery membership."""
+    run_id = f"picks:{daily_discovery_run_id}"
+    now = _utc_now()
+    try:
+        with _connect() as connection:
+            for item in items:
+                connection.execute(
+                    """INSERT INTO product_directions
+                       (direction_id,direction_key,name_en,name_zh,description_zh,direction_type,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(direction_id) DO UPDATE SET
+                       direction_key=excluded.direction_key,name_en=excluded.name_en,name_zh=excluded.name_zh,
+                       description_zh=excluded.description_zh,direction_type=excluded.direction_type,updated_at=excluded.updated_at""",
+                    (item["direction_id"], item["direction_key"], item["name_en"], item["name_zh"],
+                     item["description_zh"], item.get("product_type", ""), now, now),
+                )
+                for family_id in item.get("member_family_ids", [item["family_id"]]):
+                    connection.execute(
+                        """INSERT INTO product_direction_members
+                           (direction_id,family_id,match_reason,match_confidence,created_at)
+                           VALUES (?,?,?,?,?) ON CONFLICT(direction_id,family_id) DO UPDATE SET
+                           match_reason=excluded.match_reason,match_confidence=excluded.match_confidence""",
+                        (item["direction_id"], int(family_id), item.get("aggregation_reason", ""),
+                         item.get("aggregation_confidence", "MEDIUM"), now),
+                    )
+            connection.execute(
+                """INSERT INTO daily_picks_runs
+                   (run_id,daily_discovery_run_id,generated_at,target_count,item_count,status,metadata_json)
+                   VALUES (?,?,?,?,?,'COMPLETED',?)
+                   ON CONFLICT(daily_discovery_run_id) DO UPDATE SET
+                    generated_at=excluded.generated_at,target_count=excluded.target_count,
+                    item_count=excluded.item_count,status='COMPLETED',metadata_json=excluded.metadata_json""",
+                (run_id, daily_discovery_run_id, now, target_count, len(items),
+                 json.dumps({"membership": "deterministic-diverse-daily-picks", "ai_gate": False})),
+            )
+            connection.execute("DELETE FROM daily_picks_items WHERE picks_run_id=?", (run_id,))
+            for order, item in enumerate(items, 1):
+                connection.execute(
+                    """INSERT INTO daily_picks_items
+                       (picks_run_id,family_id,pick_order,snapshot_json,created_at,direction_id)
+                       VALUES (?,?,?,?,?,?)""",
+                    (run_id, int(item["family_id"]), order,
+                     json.dumps(item, ensure_ascii=False, default=str), now, item.get("direction_id")),
+                )
+        return run_id
+    except Exception:
+        return ""
+
+
+def get_persisted_daily_picks(*, run_id: str | None = None, daily_discovery_run_id: str | None = None) -> dict | None:
+    try:
+        with _connect() as connection:
+            if run_id:
+                row = connection.execute("SELECT * FROM daily_picks_runs WHERE run_id=?", (run_id,)).fetchone()
+            elif daily_discovery_run_id:
+                row = connection.execute("SELECT * FROM daily_picks_runs WHERE daily_discovery_run_id=?", (daily_discovery_run_id,)).fetchone()
+            else:
+                row = connection.execute("SELECT * FROM daily_picks_runs WHERE status='COMPLETED' ORDER BY generated_at DESC LIMIT 1").fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            snapshots = connection.execute(
+                "SELECT snapshot_json FROM daily_picks_items WHERE picks_run_id=? ORDER BY pick_order", (result["run_id"],)
+            ).fetchall()
+        result["items"] = [_decode_json(value["snapshot_json"], {}) for value in snapshots]
+        result["item_count"] = len(result["items"])
+        return result
+    except Exception:
+        return None
+
+
+def save_user_voice_items(items: list[dict]) -> tuple[int, int]:
+    saved = duplicates = 0
+    try:
+        with _connect() as connection:
+            for item in items:
+                cursor = connection.execute(
+                    """INSERT INTO user_voice_items
+                       (product_family_id,product_id,source,source_item_id,author,original_text,
+                        original_language,source_url,published_at,engagement_json,retrieved_at,voice_type,identity_key,
+                        product_direction_id,translated_text_zh,score_or_likes,source_post_id,source_comment_id,
+                        parent_feedback_id,retrieval_method,traceable,is_platform_ai_summary,content_hash,metadata_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(identity_key) DO NOTHING""",
+                    (item["product_family_id"], item.get("product_id"), item["source"], item.get("source_item_id"),
+                     item.get("author"), item["original_text"], item.get("original_language", "unknown"),
+                     item["source_url"], item.get("published_at"), json.dumps(item.get("engagement", {})),
+                     item["retrieved_at"], item.get("voice_type", "OTHER_DISCUSSION"), item["identity_key"],
+                     item.get("product_direction_id"), item.get("translated_text_zh"), item.get("score_or_likes"),
+                     item.get("source_post_id"), item.get("source_comment_id"), item.get("parent_feedback_id"),
+                     item.get("retrieval_method"), int(bool(item.get("traceable", True))),
+                     int(bool(item.get("is_platform_ai_summary", False))), item.get("content_hash"),
+                     json.dumps(item.get("metadata", {}), ensure_ascii=False, default=str)),
+                )
+                if cursor.rowcount == 1:
+                    saved += 1
+                else:
+                    duplicates += 1
+        return saved, duplicates
+    except Exception:
+        return 0, 0
+
+
+def get_user_voice_items(family_id: int) -> list[dict]:
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM user_voice_items WHERE product_family_id=? ORDER BY retrieved_at,id", (family_id,)
+            ).fetchall()
+        return [{**dict(row), "engagement": _decode_json(row["engagement_json"], {})} for row in rows]
+    except Exception:
+        return []
+
+
+def is_notification_delivered(delivery_key: str) -> bool:
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM notification_deliveries WHERE delivery_key=?", (delivery_key,)
+            ).fetchone()
+        return bool(row and row["status"] == "DELIVERED")
+    except Exception:
+        return False
+
+
+def record_notification_delivery(
+    delivery_key: str, daily_run_id: str, recipient_hash: str,
+    chunk_count: int, delivered_chunks: int,
+) -> None:
+    """Persist only a recipient hash; never persist UID or token."""
+    now = _utc_now()
+    status = "DELIVERED" if chunk_count and delivered_chunks == chunk_count else "PARTIAL"
+    with _connect() as connection:
+        connection.execute(
+            """INSERT INTO notification_deliveries
+               (delivery_key,daily_run_id,channel,recipient_hash,status,chunk_count,delivered_chunks,created_at,updated_at)
+               VALUES (?,?,'wxpusher',?,?,?,?,?,?) ON CONFLICT(delivery_key) DO UPDATE SET
+               status=excluded.status,chunk_count=excluded.chunk_count,
+               delivered_chunks=excluded.delivered_chunks,updated_at=excluded.updated_at""",
+            (delivery_key, daily_run_id, recipient_hash, status, chunk_count, delivered_chunks, now, now),
+        )
 
 
 def get_family_enrichment(

@@ -83,5 +83,7 @@ def test_software_reddit_defaults_to_software_and_ambiguous_identity_is_low_conf
     assert identity.normalized_product_name == "PULS Linux System Monitoring Tool"
     vague = product("A named but sentence-form launch that has no safe rewrite")
     vague_identity = normalize_identity(vague, classify_eligibility(vague))
-    assert vague_identity.source_title == vague_identity.normalized_product_name
+    assert vague_identity.source_title == "A named but sentence-form launch that has no safe rewrite"
+    assert vague_identity.normalized_product_name is None
+    assert vague_identity.confidence == "LOW"
     assert vague_identity.confidence == "LOW"

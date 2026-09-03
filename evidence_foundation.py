@@ -464,13 +464,14 @@ def normalize_identity(
     if "reddit" in product.source_platform.casefold():
         normalized = normalize_reddit_title(title, description)
         if normalized:
+            chinese = existing_chinese_name or reddit_identity_chinese(normalized)
             return ProductIdentity(
-                title, normalized, existing_chinese_name,
+                title, normalized, chinese,
                 "reddit_product_noun", "HIGH",
             )
         return ProductIdentity(
-            title, title, existing_chinese_name,
-            "reddit_literal_title", "LOW",
+            title, None, None,
+            "reddit_unresolved", "LOW",
         )
     if product.source_platform.casefold() in {"yanko_design", "design_milk"}:
         normalized = normalize_design_title(title)
@@ -566,6 +567,16 @@ def normalize_amazon_title(title: str) -> str:
 
 def normalize_reddit_title(title: str, description: str = "") -> str | None:
     text = title.casefold()
+    context = f"{title} {description}".casefold()
+    context_rules = (
+        (r"winkbed luxury firm.*(?:mattress|bed)|(?:mattress|bed).*winkbed luxury firm", "WinkBed Luxury Firm Mattress"),
+        (r"polywood.*(?:rocking chair|rocker)|(?:rocking chair|rocker).*polywood", "POLYWOOD Outdoor Rocking Chair"),
+        (r"otterbox.*(?:defender).*(?:case|series|iphone)|otterbox.*(?:phone|pixel|iphone).*case|(?:phone|pixel|iphone).*case.*otterbox", "OtterBox Phone Case"),
+        (r"kelty.*(?:tent|fiberglass pole)|(?:tent|fiberglass pole).*kelty", "Kelty Tent"),
+    )
+    contextual = next((name for pattern, name in context_rules if re.search(pattern, context, re.I)), None)
+    if contextual:
+        return contextual
     rules = (
         (r"key organi[sz]er", "Key Organizer"),
         (r"(?:fanny|waist) (?:pack|pouch).*(?:without|no) zipper|without zipper.*(?:fanny|waist)", "Zipperless Fanny Pack / Waist Pack"),
@@ -626,6 +637,21 @@ def normalize_reddit_title(title: str, description: str = "") -> str | None:
         (r"^justforms\b", "JustForms PDF Form Editor"),
     )
     return next((name for pattern, name in rules if re.search(pattern, text, re.I)), None)
+
+
+_REDDIT_IDENTITY_ZH = {
+    "WinkBed Luxury Firm Mattress": "WinkBed Luxury Firm 床垫",
+    "POLYWOOD Outdoor Rocking Chair": "POLYWOOD 户外摇椅",
+    "OtterBox Phone Case": "OtterBox 手机壳",
+    "Kelty Tent": "Kelty 帐篷",
+    "Key Organizer": "钥匙收纳器",
+    "Zipperless Fanny Pack / Waist Pack": "无拉链腰包",
+}
+
+
+def reddit_identity_chinese(normalized_name: str) -> str | None:
+    """Return only deterministic Chinese names for supported Reddit identities."""
+    return _REDDIT_IDENTITY_ZH.get(normalized_name)
 
 
 def normalize_design_title(title: str) -> str | None:

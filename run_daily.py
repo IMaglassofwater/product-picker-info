@@ -21,6 +21,7 @@ from main import run_pipeline
 from performance_timing import query_profile, timed_stage, timing_line
 from wxpusher_notifier import (
     DailyNotificationSummary, NotificationTopPick, send_daily_notification,
+    send_full_fidelity_daily,
 )
 
 
@@ -322,8 +323,12 @@ def execute_daily(
             db.finish_pipeline_run(run_id, status, error, stats=stats)
         try:
             from daily_discovery import build_daily_discovery
+            from daily_picks import build_daily_picks
             snapshot = build_daily_discovery(run_id)
             stats["daily_discovery_count"] = snapshot["item_count"]
+            daily_picks = build_daily_picks(snapshot, persist=True)
+            stats["daily_picks_run_id"] = daily_picks.get("run_id", "")
+            stats["daily_picks_count"] = daily_picks.get("item_count", 0)
         except Exception as exc:
             output(f"WARNING: Daily Discovery snapshot unavailable ({type(exc).__name__})")
         return DailyRunResult(run_id, status, ai.pending, error, stats)
@@ -366,17 +371,17 @@ def main() -> int:
         )
     if os.getenv("EVIDENCE_FIRST_WXPUSHER_ENABLED", "false").lower() in {"1", "true", "yes"}:
         try:
-            send_daily_notification(DailyNotificationSummary(
-                status=result.status,
-                new_products=int(result.stats.get("new_products", 0)),
-                ai_analyzed=int(triage.get("successful", 0)),
-                qualified=int(result.stats.get("qualified_count", 0)),
-                top_picks=top_picks,
-                failed_sources=source_failures,
-                failed_stage="Daily Pipeline" if result.status == "FAILED" else "",
-                error=result.error,
-                run_url=run_url,
-            ))
+            persisted = db.get_persisted_daily_picks(run_id=result.stats.get("daily_picks_run_id"))
+            if result.status != "FAILED" and persisted:
+                send_full_fidelity_daily(
+                    persisted, is_delivered=db.is_notification_delivered,
+                    record_delivery=db.record_notification_delivery,
+                )
+            elif result.status == "FAILED":
+                send_daily_notification(DailyNotificationSummary(
+                    status=result.status, failed_sources=source_failures,
+                    failed_stage="Daily Pipeline", error=result.error, run_url=run_url,
+                ))
         except Exception as exc:
             print(f"WARNING: WxPusher notification failed ({type(exc).__name__})")
     print(f"Daily Product Picker: {result.status}")
