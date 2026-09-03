@@ -12,6 +12,8 @@ from performance_timing import record_query
 
 
 _POOLS: dict[str, Any] = {}
+POOL_MAX_IDLE_SECONDS = 300.0
+POOL_RECONNECT_TIMEOUT_SECONDS = 30.0
 
 
 def _translate_sql(sql: str) -> str:
@@ -41,19 +43,30 @@ class PostgresConnectionAdapter:
         raise NotImplementedError("PostgreSQL schema uses initialize_postgres_schema")
 
 
+def _create_pool(database_url: str):
+    """Create a pool that validates idle Neon connections before reuse."""
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
+
+    return ConnectionPool(
+        conninfo=database_url,
+        min_size=0,
+        max_size=4,
+        kwargs={"row_factory": dict_row},
+        check=ConnectionPool.check_connection,
+        max_idle=POOL_MAX_IDLE_SECONDS,
+        reconnect_timeout=POOL_RECONNECT_TIMEOUT_SECONDS,
+        open=True,
+    )
+
+
 def _pool(database_url: str):
     pool = _POOLS.get(database_url)
+    if pool is not None and getattr(pool, "closed", False):
+        _POOLS.pop(database_url, None)
+        pool = None
     if pool is None:
-        from psycopg.rows import dict_row
-        from psycopg_pool import ConnectionPool
-
-        pool = ConnectionPool(
-            conninfo=database_url,
-            min_size=0,
-            max_size=4,
-            kwargs={"row_factory": dict_row},
-            open=True,
-        )
+        pool = _create_pool(database_url)
         _POOLS[database_url] = pool
     return pool
 
