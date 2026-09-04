@@ -1862,6 +1862,18 @@ def is_notification_delivered(delivery_key: str) -> bool:
         return False
 
 
+def get_notification_delivery_status(delivery_key: str) -> str | None:
+    """Return safe delivery state without exposing recipient or credentials."""
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM notification_deliveries WHERE delivery_key=?", (delivery_key,)
+            ).fetchone()
+        return str(row["status"]) if row else None
+    except Exception:
+        return None
+
+
 def record_notification_delivery(
     delivery_key: str, daily_run_id: str, recipient_hash: str,
     chunk_count: int, delivered_chunks: int,

@@ -1,0 +1,27 @@
+name: WxPusher Full-Fidelity Acceptance
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: wxpusher-full-fidelity-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+      - name: Send persisted full-fidelity Daily report once
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+        run: python scripts/wxpusher_acceptance.py
