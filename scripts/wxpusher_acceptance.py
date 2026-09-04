@@ -14,56 +14,26 @@ if str(ROOT) not in sys.path:
 import db
 from daily_direction_report import (
     DEFAULT_WXPUSHER_MAX_CHARS,
-    render_wxpusher_messages,
-    validate_web_wxpusher_parity,
+    validate_notification_snapshot,
 )
 from wxpusher_notifier import (
+    ACCEPTANCE_DELIVERY_CHANNEL,
     WxPusherNotifier,
     notification_delivery_key,
     send_full_fidelity_daily,
 )
 
 
-DELIVERY_PURPOSE = "wxpusher_full_fidelity_acceptance"
+DELIVERY_PURPOSE = ACCEPTANCE_DELIVERY_CHANNEL
 
 
 def validate_snapshot(dataset: dict) -> tuple[list[dict], dict]:
     """Fail closed unless the persisted snapshot is complete and render-safe."""
-    items = list(dataset.get("items") or [])
-    if not dataset.get("run_id") or not items:
-        raise ValueError("persisted Daily snapshot is missing or empty")
-
-    direction_ids = [str(item.get("direction_id") or "") for item in items]
-    if any(not value for value in direction_ids) or len(direction_ids) != len(set(direction_ids)):
-        raise ValueError("Daily snapshot contains missing or duplicate Direction IDs")
-
-    voice_ids: list[str] = []
-    for item in items:
-        if not (item.get("name_zh") or item.get("canonical_name_zh")):
-            raise ValueError(f"missing Chinese name for Direction {item['direction_id']}")
-        if not item.get("description_zh"):
-            raise ValueError(f"missing Chinese description for Direction {item['direction_id']}")
-        for voice in item.get("user_voice") or []:
-            voice_id = str(voice.get("user_voice_id") or "")
-            if not voice_id or voice_id in voice_ids:
-                raise ValueError("Daily snapshot contains missing or duplicate User Voice IDs")
-            voice_ids.append(voice_id)
-            if not voice.get("translated_text_zh"):
-                raise ValueError(f"missing Chinese User Voice translation: {voice_id}")
-            if not voice.get("original_text"):
-                raise ValueError(f"missing English User Voice original: {voice_id}")
-            if not voice.get("source_url"):
-                raise ValueError(f"missing User Voice source URL: {voice_id}")
-
-    messages = render_wxpusher_messages(dataset, max_chars=DEFAULT_WXPUSHER_MAX_CHARS)
-    if len(messages) != 1:
-        raise ValueError(
-            f"acceptance report requires {len(messages)} messages; expected exactly one"
-        )
-    parity = validate_web_wxpusher_parity(dataset, messages)
-    if not parity.get("overall"):
-        raise ValueError("Web and WxPusher report parity validation failed")
-    return messages, parity
+    return validate_notification_snapshot(
+        dataset,
+        max_chars=DEFAULT_WXPUSHER_MAX_CHARS,
+        require_single_message=True,
+    )
 
 
 def run_acceptance(*, notifier: WxPusherNotifier | None = None) -> dict:

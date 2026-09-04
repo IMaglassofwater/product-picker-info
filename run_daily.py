@@ -20,7 +20,8 @@ from daily_ranker import (
 from main import run_pipeline
 from performance_timing import query_profile, timed_stage, timing_line
 from wxpusher_notifier import (
-    DailyNotificationSummary, NotificationTopPick, send_daily_notification,
+    ACCEPTANCE_DELIVERY_CHANNEL, DailyNotificationSummary, NotificationTopPick,
+    WxPusherNotifier, notification_delivery_key, send_daily_notification,
     send_full_fidelity_daily,
 )
 
@@ -373,8 +374,21 @@ def main() -> int:
         try:
             persisted = db.get_persisted_daily_picks(run_id=result.stats.get("daily_picks_run_id"))
             if result.status != "FAILED" and persisted:
+                from daily_direction_report import validate_notification_snapshot
+                validate_notification_snapshot(persisted)
+                sender = WxPusherNotifier.from_env()
+                acceptance_key, _recipient_hash = notification_delivery_key(
+                    str(persisted["run_id"]), sender.uid,
+                    channel=ACCEPTANCE_DELIVERY_CHANNEL,
+                )
+
+                def already_delivered(delivery_key: str) -> bool:
+                    return db.is_notification_delivered(delivery_key) or db.is_notification_delivered(
+                        acceptance_key
+                    )
+
                 send_full_fidelity_daily(
-                    persisted, is_delivered=db.is_notification_delivered,
+                    persisted, notifier=sender, is_delivered=already_delivered,
                     record_delivery=db.record_notification_delivery,
                 )
             elif result.status == "FAILED":

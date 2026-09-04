@@ -45,4 +45,4 @@ def test_production_today_uses_single_persisted_path_without_enabling_wxpusher()
     app = Path("app.py").read_text(encoding="utf-8")
     assert "if selected_page == NAVIGATION_TABS[0]:\n    evidence_first_today_page()" in app
     workflow = Path(".github/workflows/daily-product-picker.yml").read_text(encoding="utf-8")
-    assert 'EVIDENCE_FIRST_WXPUSHER_ENABLED: "false"' in workflow
+    assert 'EVIDENCE_FIRST_WXPUSHER_ENABLED: "true"' in workflow

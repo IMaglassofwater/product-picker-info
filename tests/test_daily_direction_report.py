@@ -2,9 +2,11 @@
 from copy import deepcopy
 import json
 
+import pytest
+
 from daily_direction_report import (
     prepare_daily_payload, render_web_today, render_wxpusher_messages,
-    validate_web_wxpusher_parity,
+    validate_notification_snapshot, validate_web_wxpusher_parity,
 )
 from wxpusher_notifier import WxPusherNotifier, notification_delivery_key, send_full_fidelity_daily
 from database_backend import DatabaseSettings
@@ -29,6 +31,23 @@ def review():
     return {"identity_key":"review:1","source":"product_hunt","voice_type":"PRODUCT_REVIEW","display_type_zh":"产品评价",
         "translated_text_zh":"这款工具能可靠提取网页数据。","original_text":"This tool reliably extracts web data.","author":"Public Reviewer",
         "published_at":"2026-09-02","source_url":"https://example.test/review/1"}
+
+
+def test_notification_snapshot_integrity_gate_accepts_complete_payload():
+    messages, parity = validate_notification_snapshot(payload([direction(voice=[review()])]))
+    assert len(messages) == 1
+    assert parity["overall"] is True
+
+
+def test_notification_snapshot_integrity_gate_rejects_missing_translation_and_duplicates():
+    missing = payload([direction(voice=[review()])])
+    missing["items"][0]["user_voice"][0]["translated_text_zh"] = ""
+    with pytest.raises(ValueError, match="Chinese User Voice"):
+        validate_notification_snapshot(missing)
+
+    duplicate = payload([direction(1), direction(1)])
+    with pytest.raises(ValueError, match="duplicate Direction"):
+        validate_notification_snapshot(duplicate)
 
 
 def test_stable_ids_members_singletons_and_cross_platform_evidence():

@@ -196,8 +196,9 @@ def test_production_workflow_schedule_manual_limit_and_neon_only():
     assert "workflow_dispatch:" in WORKFLOW
     assert 'default: "5"' in WORKFLOW
     assert "MAX_DAILY_TRIAGE_CALLS:" in WORKFLOW and "'30'" in WORKFLOW
-    assert "if: github.event_name == 'workflow_dispatch' || vars.DAILY_SCHEDULE_ENABLED == 'true'" in WORKFLOW
-    assert "DAILY_SCHEDULE_ENABLED: ${{ vars.DAILY_SCHEDULE_ENABLED || 'false' }}" in WORKFLOW
+    assert "if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'" in WORKFLOW
+    assert 'EVIDENCE_FIRST_WXPUSHER_ENABLED: "true"' in WORKFLOW
+    assert 'DAILY_SCHEDULE_ENABLED: "true"' in WORKFLOW
     assert 'PRODUCTION_DAILY: "true"' in WORKFLOW
     assert "secrets.DATABASE_URL" in WORKFLOW
     assert "secrets.WXPUSHER_APP_TOKEN" in WORKFLOW

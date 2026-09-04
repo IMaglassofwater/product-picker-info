@@ -98,8 +98,10 @@ def test_acceptance_allows_only_one_full_fidelity_attempt(monkeypatch):
 def test_acceptance_rejects_multi_message_report(monkeypatch):
     monkeypatch.setattr(
         acceptance,
-        "render_wxpusher_messages",
-        lambda *_args, **_kwargs: [{"content": "a"}, {"content": "b"}],
+        "validate_notification_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("acceptance report requires 2 messages; expected exactly one")
+        ),
     )
     with pytest.raises(ValueError, match="exactly one"):
         acceptance.validate_snapshot(snapshot())

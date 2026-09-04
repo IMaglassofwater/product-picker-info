@@ -15,6 +15,7 @@ import requests
 WXPUSHER_API_URL = "https://wxpusher.zjiecode.com/api/send/message"
 REPORT_URL = "https://65sk9kjfnxz3dzan43yso4.streamlit.app/"
 DEFAULT_TIMEOUT_SECONDS = 12
+ACCEPTANCE_DELIVERY_CHANNEL = "wxpusher_full_fidelity_acceptance"
 
 
 @dataclass(frozen=True)
