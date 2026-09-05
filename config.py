@@ -105,3 +105,7 @@ def _positive_int(name: str, default: int) -> int:
 
 
 MAX_DAILY_TRIAGE_CALLS = _positive_int("MAX_DAILY_TRIAGE_CALLS", 30)
+DAILY_PREPARATION_BUDGET_SECONDS = _positive_int(
+    "DAILY_PREPARATION_BUDGET_SECONDS", 32 * 60,
+)
+STALE_PIPELINE_RUN_MINUTES = _positive_int("STALE_PIPELINE_RUN_MINUTES", 60)

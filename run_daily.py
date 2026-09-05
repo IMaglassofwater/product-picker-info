@@ -45,6 +45,7 @@ class DailyAIResult:
     output_tokens: int = 0
     total_tokens: int = 0
     unavailable: bool = False
+    budget_exhausted: bool = False
     statuses: Counter = field(default_factory=Counter)
     errors: list[str] = field(default_factory=list)
 
@@ -106,6 +107,8 @@ def run_daily_triage(
     provider: BaseAIProvider | None = None,
     opportunities: list[OpportunityInput] | None = None,
     output: Callable[[str], None] = print,
+    deadline_monotonic: float | None = None,
+    monotonic: Callable[[], float] = perf_counter,
 ) -> DailyAIResult:
     """Process new candidates first, then re-evaluations and historical backlog."""
     budget = max(1, limit or config.MAX_DAILY_TRIAGE_CALLS)
@@ -171,6 +174,13 @@ def run_daily_triage(
             for item in group:
                 if result.selected >= budget:
                     break
+                # One Gemini item can use two 65-second project attempts.
+                if (
+                    deadline_monotonic is not None
+                    and monotonic() + 130 > deadline_monotonic
+                ):
+                    result.budget_exhausted = True
+                    break
                 result.selected += 1
                 result.new_selected += int(group_name == "new")
                 result.backlog_selected += int(group_name == "backlog")
@@ -202,6 +212,8 @@ def run_daily_triage(
                     result.errors.append(f"{item.candidate_id}: Gemini triage failed")
             if result.selected >= budget:
                 break
+            if result.budget_exhausted:
+                break
 
     result.calls = max(0, getattr(provider, "api_calls_sent", 0) - calls_before)
     usage = getattr(provider, "usage", {})
@@ -228,9 +240,15 @@ def execute_daily(
     ai_step: Callable[[], int | DailyAIResult] | None = None,
     lock_path: Path = LOCK_PATH,
     output: Callable[[str], None] = print,
+    preparation_budget_seconds: int | None = None,
+    monotonic: Callable[[], float] = perf_counter,
+    discovery_date: str | None = None,
 ) -> DailyRunResult:
     """Run ingestion, bounded AI backlog coverage, and optional-deep ranking."""
-    pipeline_started = perf_counter()
+    pipeline_started = monotonic()
+    preparation_deadline = pipeline_started + (
+        preparation_budget_seconds or config.DAILY_PREPARATION_BUDGET_SECONDS
+    )
     lock = PipelineLock(lock_path)
     if not lock.acquire():
         return DailyRunResult("", "FAILED", 0, "pipeline already running")
@@ -239,12 +257,18 @@ def execute_daily(
         with query_profile(output, "database_init"):
             if not db.init_db():
                 return DailyRunResult("", "FAILED", 0, "database initialization failed")
+        recovered = db.recover_stale_pipeline_runs(
+            stale_after_minutes=config.STALE_PIPELINE_RUN_MINUTES,
+        )
+        if recovered:
+            output(f"Recovered stale pipeline runs: {len(recovered)}")
         with query_profile(output, "candidate_loading_before"):
             before_products = len(db.get_all_product_urls())
             before_opportunities = {item.candidate_id for item in load_current_opportunities()}
         run_id = db.start_pipeline_run()
         step = pipeline_step or (lambda current_id: run_pipeline(
             run_id=current_id, finish_run=False, output=output,
+            deadline_monotonic=preparation_deadline, monotonic=monotonic,
         ))
         with timed_stage(output, "source_ingestion_total"):
             pipeline_ok = step(run_id)
@@ -263,6 +287,8 @@ def execute_daily(
                 new_candidate_ids=new_candidate_ids,
                 opportunities=opportunities,
                 output=output,
+                deadline_monotonic=preparation_deadline,
+                monotonic=monotonic,
             )
             ai = ai_value if isinstance(ai_value, DailyAIResult) else DailyAIResult(
                 config.MAX_DAILY_TRIAGE_CALLS, pending=int(ai_value)
@@ -318,6 +344,8 @@ def execute_daily(
             errors.append(f"{source_failures} source(s) unavailable")
         if ai.unavailable or ai.failed:
             errors.append("Gemini unavailable for some candidates; AI remains PENDING")
+        if ai.budget_exhausted:
+            errors.append("daily preparation budget exhausted; optional Gemini work deferred")
         status = "PARTIAL" if errors else "SUCCESS"
         error = "; ".join(errors)
         with query_profile(output, "pipeline_run_finalization"):
@@ -325,7 +353,7 @@ def execute_daily(
         try:
             from daily_discovery import build_daily_discovery
             from daily_picks import build_daily_picks
-            snapshot = build_daily_discovery(run_id)
+            snapshot = build_daily_discovery(run_id, discovery_date=discovery_date)
             stats["daily_discovery_count"] = snapshot["item_count"]
             daily_picks = build_daily_picks(snapshot, persist=True)
             stats["daily_picks_run_id"] = daily_picks.get("run_id", "")
@@ -333,21 +361,80 @@ def execute_daily(
         except Exception as exc:
             output(f"WARNING: Daily Discovery snapshot unavailable ({type(exc).__name__})")
         return DailyRunResult(run_id, status, ai.pending, error, stats)
+    except Exception as exc:
+        if run_id:
+            db.finish_pipeline_run(
+                run_id, "FAILED", f"daily pipeline failed ({type(exc).__name__})",
+            )
+        return DailyRunResult(
+            run_id, "FAILED", 0, f"Unexpected {type(exc).__name__}",
+        )
     finally:
         lock.release()
         output(timing_line(
-            stage="pipeline_total", duration_s=perf_counter() - pipeline_started,
+            stage="pipeline_total", duration_s=monotonic() - pipeline_started,
         ))
 
 
+def recover_daily_from_existing_run(
+    pipeline_run_id: str, discovery_date: str, *, output: Callable[[str], None] = print,
+) -> DailyRunResult:
+    """Build a catch-up Daily from already-persisted run evidence without scraping or AI."""
+    if not db.init_db():
+        return DailyRunResult("", "FAILED", 0, "database initialization failed")
+    db.recover_stale_pipeline_runs(
+        stale_after_minutes=config.STALE_PIPELINE_RUN_MINUTES,
+    )
+    try:
+        from daily_discovery import build_daily_discovery
+        from daily_picks import build_daily_picks
+
+        snapshot = build_daily_discovery(
+            pipeline_run_id, discovery_date=discovery_date,
+        )
+        if not snapshot.get("items"):
+            return DailyRunResult(
+                pipeline_run_id, "FAILED", 0,
+                "existing pipeline run has no eligible Daily Discovery evidence",
+            )
+        daily_picks = build_daily_picks(snapshot, persist=True)
+        stats = {
+            "daily_discovery_count": snapshot["item_count"],
+            "daily_picks_run_id": daily_picks.get("run_id", ""),
+            "daily_picks_count": daily_picks.get("item_count", 0),
+            "catch_up": True,
+            "discovery_date": discovery_date,
+            "sources": [],
+            "triage": {},
+            "top_picks": [],
+        }
+        return DailyRunResult(
+            pipeline_run_id, "PARTIAL", 0,
+            "catch-up reused persisted observations and evidence", stats,
+        )
+    except Exception as exc:
+        output(f"WARNING: Catch-up Daily unavailable ({type(exc).__name__})")
+        return DailyRunResult(
+            pipeline_run_id, "FAILED", 0, f"Catch-up failed ({type(exc).__name__})",
+        )
+
+
 def main() -> int:
+    catch_up_run_id = os.getenv("CATCH_UP_PIPELINE_RUN_ID", "").strip()
+    catch_up_date = os.getenv("PRODUCT_PICKER_DISCOVERY_DATE", "").strip()
     if os.getenv("PRODUCTION_DAILY", "").casefold() == "true" and db.DATABASE_SETTINGS.backend != "postgresql":
         result = DailyRunResult(
             "", "FAILED", 0, "Production daily runner requires PostgreSQL DATABASE_URL",
         )
     else:
         try:
-            result = execute_daily()
+            result = (
+                recover_daily_from_existing_run(catch_up_run_id, catch_up_date)
+                if catch_up_run_id and catch_up_date
+                else execute_daily(discovery_date=catch_up_date)
+                if catch_up_date
+                else execute_daily()
+            )
         except Exception as exc:
             result = DailyRunResult(
                 "", "FAILED", 0, f"Unexpected {type(exc).__name__}",

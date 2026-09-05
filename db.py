@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from time import perf_counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from pathlib import Path
 
@@ -1121,6 +1121,47 @@ def start_pipeline_run() -> str:
         return run_id
     except sqlite3.Error:
         return ""
+
+
+def recover_stale_pipeline_runs(
+    *, stale_after_minutes: int = 60, now: datetime | None = None,
+) -> list[str]:
+    """Mark clearly stale RUNNING rows failed without touching recent runs."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    recovered: list[str] = []
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, started_at FROM pipeline_runs WHERE status = 'RUNNING'"
+            ).fetchall()
+            for row in rows:
+                try:
+                    started = datetime.fromisoformat(
+                        str(row["started_at"]).replace("Z", "+00:00")
+                    )
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                if current - started <= timedelta(minutes=max(1, stale_after_minutes)):
+                    continue
+                cursor = connection.execute(
+                    """UPDATE pipeline_runs
+                       SET finished_at = ?, status = 'FAILED', error = ?
+                       WHERE run_id = ? AND status = 'RUNNING'""",
+                    (
+                        current.isoformat(),
+                        "stale run recovered after external cancellation",
+                        row["run_id"],
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    recovered.append(str(row["run_id"]))
+        return recovered
+    except Exception:
+        return []
 
 
 def record_pipeline_source_run(

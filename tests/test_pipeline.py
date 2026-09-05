@@ -150,6 +150,28 @@ def test_phase11e_source_failure_does_not_stop_other_new_sources(tmp_path, monke
     assert db.get_all_products()[0].source_platform == "hacker_news"
 
 
+def test_daily_deadline_defers_sources_without_failing_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "product_picker.db")
+    messages: list[str] = []
+    scrapers = [
+        _MockScraper("product_hunt", [_product("product_hunt", 1)]),
+        _MockScraper("kickstarter", [_product("kickstarter", 1)]),
+    ]
+    assert main.run_pipeline(
+        scrapers=scrapers, output=messages.append,
+        deadline_monotonic=10, monotonic=lambda: 10,
+    ) is True
+    assert "remaining sources deferred" in "\n".join(messages)
+    with sqlite3.connect(db.DB_PATH) as connection:
+        rows = connection.execute(
+            "SELECT source_platform, failed, error FROM pipeline_source_runs ORDER BY id"
+        ).fetchall()
+    assert rows == [
+        ("product_hunt", 1, "daily preparation budget exhausted"),
+        ("kickstarter", 1, "daily preparation budget exhausted"),
+    ]
+
+
 def test_deferred_design_milk_does_not_block_software_reddit(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "product_picker.db")
     messages: list[str] = []

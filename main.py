@@ -85,6 +85,8 @@ def run_pipeline(
     *,
     run_id: str | None = None,
     finish_run: bool = True,
+    deadline_monotonic: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> bool:
     """Fetch all sources independently, filter products, and save them."""
     output(SEPARATOR)
@@ -103,7 +105,21 @@ def run_pipeline(
     source_stats: dict[str, dict] = {}
     products: list[Product] = []
     total_fetched = 0
-    for scraper in scrapers if scrapers is not None else SCRAPERS:
+    active_scrapers = list(scrapers if scrapers is not None else SCRAPERS)
+    for scraper_index, scraper in enumerate(active_scrapers):
+        if deadline_monotonic is not None and monotonic() >= deadline_monotonic:
+            output("Daily preparation budget reached; remaining sources deferred")
+            for deferred in active_scrapers[scraper_index:]:
+                source_stats[deferred.source_name] = {
+                    "fetched": 0, "products": [], "failed": True,
+                    "error": "daily preparation budget exhausted",
+                }
+                if run_id:
+                    db.record_pipeline_source_run(
+                        run_id, deferred.source_name, failed=True,
+                        error="daily preparation budget exhausted",
+                    )
+            break
         source_label = SOURCE_LABELS.get(
             scraper.source_name,
             scraper.source_name.replace("_", " ").title(),

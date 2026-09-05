@@ -7,6 +7,7 @@ from html import escape
 from typing import Iterable
 
 import db
+from business_time import product_picker_business_date
 
 EVIDENCE_ORDER = {"STRONG": 0, "MODERATE": 1, "WEAK": 2}
 WXPUSHER_ITEMS_PER_CHUNK = 20
@@ -60,7 +61,9 @@ def _snapshot_item(item: dict) -> dict:
     }
 
 
-def build_daily_discovery(pipeline_run_id: str, *, persist: bool = True) -> dict:
+def build_daily_discovery(
+    pipeline_run_id: str, *, persist: bool = True, discovery_date: str | None = None,
+) -> dict:
     """Build one complete run-scoped snapshot without AI or legacy ranking gates."""
     items = [_snapshot_item(value) for value in db.get_daily_discovery(pipeline_run_id)]
     items.sort(key=lambda value: (
@@ -74,12 +77,13 @@ def build_daily_discovery(pipeline_run_id: str, *, persist: bool = True) -> dict
     result = {
         "pipeline_run_id": pipeline_run_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "discovery_date": discovery_date or product_picker_business_date().isoformat(),
         "items": items,
         "item_count": len(items),
     }
     if persist:
         result["run_id"] = db.persist_daily_discovery_snapshot(
-            pipeline_run_id, items, discovery_date=result["generated_at"][:10],
+            pipeline_run_id, items, discovery_date=result["discovery_date"],
             metadata={"membership": "observed+eligible+concrete+active-family", "ordering": "evidence,freshness,identity"},
         )
     return result

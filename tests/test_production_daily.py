@@ -109,6 +109,30 @@ def test_existing_gemini_is_skipped(monkeypatch):
     assert provider.titles == ["Opportunity 2"]
 
 
+def test_existing_valid_enrichment_is_reused_without_api_call(monkeypatch):
+    items = [opportunity(1)]
+    setup_triage(monkeypatch, items, existing={"c1"})
+    provider = FakeGemini()
+    result = run_daily_triage(
+        limit=1, provider=provider, deadline_monotonic=1000,
+        monotonic=lambda: 0,
+    )
+    assert result.skipped_existing == 1
+    assert result.calls == 0
+
+
+def test_triage_deadline_stops_optional_calls(monkeypatch):
+    items = [opportunity(1)]
+    setup_triage(monkeypatch, items)
+    provider = FakeGemini()
+    result = run_daily_triage(
+        limit=1, provider=provider, deadline_monotonic=129,
+        monotonic=lambda: 0,
+    )
+    assert result.budget_exhausted is True
+    assert result.selected == result.calls == 0
+
+
 def test_re_evaluate_forces_only_requested_candidate(monkeypatch):
     item = opportunity(1)
     _, saved = setup_triage(monkeypatch, [item], existing={"c1"})
@@ -200,6 +224,9 @@ def test_production_workflow_schedule_manual_limit_and_neon_only():
     assert 'EVIDENCE_FIRST_WXPUSHER_ENABLED: "true"' in WORKFLOW
     assert 'DAILY_SCHEDULE_ENABLED: "true"' in WORKFLOW
     assert 'PRODUCTION_DAILY: "true"' in WORKFLOW
+    assert 'DAILY_PREPARATION_BUDGET_SECONDS: "1920"' in WORKFLOW
+    assert "catch_up_pipeline_run_id:" in WORKFLOW
+    assert "discovery_date:" in WORKFLOW
     assert "secrets.DATABASE_URL" in WORKFLOW
     assert "secrets.WXPUSHER_APP_TOKEN" in WORKFLOW
     assert "secrets.WXPUSHER_UID" in WORKFLOW
