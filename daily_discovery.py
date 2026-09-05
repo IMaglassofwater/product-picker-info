@@ -10,6 +10,7 @@ from typing import Iterable
 import db
 import config
 from business_time import product_picker_business_date
+from business_window import daily_window, effective_evidence_timestamp, record_in_window
 
 EVIDENCE_ORDER = {"STRONG": 0, "MODERATE": 1, "WEAK": 2}
 WXPUSHER_ITEMS_PER_CHUNK = 20
@@ -144,6 +145,65 @@ def build_rolling_daily_discovery(
         result["run_id"] = db.persist_daily_discovery_snapshot(
             anchor, items, discovery_date=result["discovery_date"],
             metadata={"membership": "rolling persisted observations", "window_days": max(1, days), "source_run_ids": run_ids},
+        )
+    return result
+
+
+def build_strict_daily_discovery(
+    *, business_date: str | None = None, persist: bool = False,
+) -> dict:
+    """Build only from evidence in the fixed Shanghai noon-to-noon window."""
+    start, end, selected_date = daily_window(business_date)
+    # Query from window start onward so a source item published before noon but
+    # persisted during the one-hour compose buffer remains eligible.
+    raw_items = db.get_recent_daily_discovery(start.astimezone(timezone.utc).isoformat())
+    items = []
+    timestamp_limitations = 0
+    for raw in raw_items:
+        item = _snapshot_item(raw)
+        records = []
+        for record in item.get("source_records", []):
+            timestamp, method = effective_evidence_timestamp(record)
+            if timestamp is not None and start <= timestamp < end:
+                value = dict(record)
+                value["daily_evidence_timestamp"] = timestamp.isoformat()
+                value["daily_timestamp_method"] = method
+                records.append(value)
+                timestamp_limitations += int(method == "observation")
+        if not records:
+            continue
+        item["source_records"] = records
+        item["source_platforms"] = sorted({r["source_platform"] for r in records})
+        descriptions = [" ".join(str(r.get("description") or "").split()) for r in records if str(r.get("description") or "").strip()]
+        item["factual_description"] = min(descriptions, key=len)[:300] if descriptions else ""
+        item["factual_description_zh"] = item["factual_description_zh"] if item["factual_description"] else ""
+        items.append(item)
+    items.sort(key=lambda value: (
+        EVIDENCE_ORDER.get(str(value.get("evidence_strength", "WEAK")).upper(), 3),
+        -_timestamp(value.get("latest_observed_at")), str(value.get("canonical_name", "")).casefold(),
+    ))
+    for order, item in enumerate(items, 1):
+        item["display_order"] = order
+    latest = db.get_latest_completed_run() or {}
+    anchor = str(latest.get("run_id") or "")
+    result = {
+        "pipeline_run_id": anchor, "run_id": f"daily:{anchor}" if anchor else "strict:empty",
+        "generated_at": datetime.now(timezone.utc).isoformat(), "discovery_date": selected_date.isoformat(),
+        "window_start": start.isoformat(), "window_end": end.isoformat(),
+        "fallback_enabled": False, "timestamp_observation_fallback_count": timestamp_limitations,
+        "source_failures": db.get_source_failures_between(
+            start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat(),
+        ),
+        "items": items, "item_count": len(items),
+    }
+    if persist and anchor:
+        result["run_id"] = db.persist_daily_discovery_snapshot(
+            anchor, items, discovery_date=result["discovery_date"], metadata={
+                "membership": "strict Shanghai noon-to-noon evidence window",
+                "window_start": start.isoformat(), "window_end": end.isoformat(),
+                "fallback_enabled": False,
+                "timestamp_observation_fallback_count": timestamp_limitations,
+            },
         )
     return result
 

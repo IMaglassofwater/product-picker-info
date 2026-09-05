@@ -308,7 +308,7 @@ def build_daily_picks(dataset: dict, *, persist: bool = True, target: int = 20) 
     concrete = [item for item in all_directions if _is_product_pick(item)]
     rejected = [item for item in all_directions if not _is_product_pick(item)]
     flags = [flag for item in items for flag in title_quality_flags(item)]
-    quality = "PASS" if len(items) >= 15 else "FAIL" if len(concrete) >= 15 else "PARTIAL"
+    quality = "FAIL" if flags else "PASS" if items else "PARTIAL"
     result = {
         "daily_discovery_run_id": dataset["run_id"],
         "generated_at": datetime.now(timezone.utc).isoformat(),

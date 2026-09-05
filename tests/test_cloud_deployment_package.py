@@ -86,11 +86,13 @@ def test_production_filter_and_skipped_product_reason_are_documented():
 
 def test_workflow_has_schedule_manual_trigger_and_only_secret_references():
     assert "schedule:" in WORKFLOW
-    assert 'cron: "0 23 * * *"' in WORKFLOW
+    assert 'cron: "0 5 * * *"' in WORKFLOW
+    assert 'cron: "0 23 * * *"' not in WORKFLOW
     assert "workflow_dispatch:" in WORKFLOW
     assert "push:" not in WORKFLOW
     assert "secrets.DATABASE_URL" in WORKFLOW
-    assert "secrets.GEMINI_API_KEY" in WORKFLOW
+    assert "secrets.GEMINI_API_KEY" not in WORKFLOW
+    assert "secrets.WXPUSHER_APP_TOKEN" in WORKFLOW
     assert "postgresql://" not in WORKFLOW
     assert "AIza" not in WORKFLOW
 

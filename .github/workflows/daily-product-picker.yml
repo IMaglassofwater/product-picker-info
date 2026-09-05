@@ -1,66 +1,37 @@
-name: Daily Product Picker
+name: Daily Product Picker Compose
 
 on:
   workflow_dispatch:
     inputs:
-      max_daily_triage_calls:
-        description: "Gemini Cheap Triage call limit for this manual run"
-        required: false
-        default: "5"
-      notification_test_only:
-        description: "Send only the WxPusher connectivity test (no scraping or Gemini)"
-        required: false
-        type: boolean
-        default: false
-      catch_up_pipeline_run_id:
-        description: "Existing pipeline run ID to reuse without scraping or Gemini"
-        required: false
-        default: ""
       discovery_date:
-        description: "Asia/Shanghai business date override for an authorized catch-up"
+        description: "Optional Asia/Shanghai business date override"
         required: false
         default: ""
   schedule:
-    # 23:00 UTC is 08:00 JST on the following calendar day.
-    - cron: "0 23 * * *"
+    # 05:00 UTC is 13:00 Asia/Shanghai.
+    - cron: "0 5 * * *"
 
 concurrency:
-  group: daily-product-picker
+  group: daily-product-picker-compose
   cancel-in-progress: false
 
 jobs:
-  daily:
-    # This is the single authoritative scheduled Product Picker pipeline.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+  compose:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install runtime dependencies
-        run: pip install -r requirements.txt
-      - name: Test WxPusher notification only
-        if: github.event_name == 'workflow_dispatch' && inputs.notification_test_only == true
-        env:
-          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
-        run: python -m wxpusher_notifier --test
-      - name: Run daily pipeline
-        if: github.event_name == 'schedule' || inputs.notification_test_only != true
+      - run: pip install -r requirements.txt
+      - name: Compose persisted Daily and notify
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_TRIAGE_MODEL: gemini-3.5-flash-lite
-          DAILY_SCHEDULE_ENABLED: "true"
-          PRODUCTION_DAILY: "true"
-          MAX_DAILY_TRIAGE_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_daily_triage_calls || '30' }}
-          DAILY_PREPARATION_BUDGET_SECONDS: "1920"
-          CATCH_UP_PIPELINE_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.catch_up_pipeline_run_id || '' }}
+          DAILY_FALLBACK_ENABLED: "false"
           PRODUCT_PICKER_DISCOVERY_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.discovery_date || '' }}
           EVIDENCE_FIRST_WXPUSHER_ENABLED: "true"
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
-        run: python -u run_daily.py
+        run: python -u compose_daily.py

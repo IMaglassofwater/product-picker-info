@@ -1596,6 +1596,34 @@ def get_recent_completed_run_ids(cutoff_timestamp: str) -> list[str]:
         return []
 
 
+def get_source_failures_between(start_timestamp: str, end_timestamp: str) -> list[dict]:
+    """Return recorded source failures overlapping the strict composition window."""
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """SELECT s.source_platform,s.error,r.run_id,r.started_at
+                   FROM pipeline_source_runs s JOIN pipeline_runs r ON r.run_id=s.run_id
+                   WHERE s.failed=? AND r.started_at>=? AND r.started_at<?
+                   ORDER BY r.started_at,s.source_platform""",
+                (True, start_timestamp, end_timestamp),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+def get_pipeline_source_failure_count(run_id: str) -> int:
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM pipeline_source_runs WHERE run_id=? AND failed=?",
+                (run_id, True),
+            ).fetchone()
+        return int(row["count"] if row else 0)
+    except Exception:
+        return 0
+
+
 def get_recent_daily_discovery(cutoff_timestamp: str) -> list[dict]:
     """Load the rolling eligible evidence pool with three bounded batch queries."""
     try:
@@ -1616,14 +1644,16 @@ def get_recent_daily_discovery(cutoff_timestamp: str) -> list[dict]:
                 (cutoff_timestamp,),
             ).fetchall()
             records = connection.execute(
-                """SELECT DISTINCT fm.family_id,p.source_platform,p.url,p.id AS product_id,
-                          p.title AS source_title,p.category,p.description,p.raw_data
+                """SELECT fm.family_id,p.source_platform,p.url,p.id AS product_id,
+                          p.title AS source_title,p.category,p.description,p.raw_data,
+                          MAX(o.observed_at) AS observation_timestamp
                    FROM product_observations o JOIN products p ON p.id=o.product_id
                    JOIN product_eligibility e ON e.product_id=p.id
                    JOIN product_family_members fm ON fm.product_id=p.id
                    JOIN product_families f ON f.id=fm.family_id
                    WHERE o.observed_at>=? AND e.eligibility_status='ELIGIBLE'
                      AND e.concrete_product_status='CONCRETE' AND f.status='ACTIVE'
+                   GROUP BY fm.family_id,p.source_platform,p.url,p.id,p.title,p.category,p.description,p.raw_data
                    ORDER BY fm.family_id,p.source_platform,p.id""",
                 (cutoff_timestamp,),
             ).fetchall()

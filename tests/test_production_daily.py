@@ -216,21 +216,15 @@ def test_not_interested_is_excluded_from_today():
 
 
 def test_production_workflow_schedule_manual_limit_and_neon_only():
-    assert 'cron: "0 23 * * *"' in WORKFLOW
+    assert 'cron: "0 5 * * *"' in WORKFLOW
+    assert 'cron: "0 23 * * *"' not in WORKFLOW
     assert "workflow_dispatch:" in WORKFLOW
-    assert 'default: "5"' in WORKFLOW
-    assert "MAX_DAILY_TRIAGE_CALLS:" in WORKFLOW and "'30'" in WORKFLOW
-    assert "if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'" in WORKFLOW
     assert 'EVIDENCE_FIRST_WXPUSHER_ENABLED: "true"' in WORKFLOW
-    assert 'DAILY_SCHEDULE_ENABLED: "true"' in WORKFLOW
-    assert 'PRODUCTION_DAILY: "true"' in WORKFLOW
-    assert 'DAILY_PREPARATION_BUDGET_SECONDS: "1920"' in WORKFLOW
-    assert "catch_up_pipeline_run_id:" in WORKFLOW
+    assert 'DAILY_FALLBACK_ENABLED: "false"' in WORKFLOW
     assert "discovery_date:" in WORKFLOW
     assert "secrets.DATABASE_URL" in WORKFLOW
     assert "secrets.WXPUSHER_APP_TOKEN" in WORKFLOW
     assert "secrets.WXPUSHER_UID" in WORKFLOW
-    assert "notification_test_only:" in WORKFLOW
-    assert "python -m wxpusher_notifier --test" in WORKFLOW
+    assert "python -u compose_daily.py" in WORKFLOW
     assert "product_picker.db" not in WORKFLOW and "D:\\" not in WORKFLOW
     assert "stats_json JSONB" in (Path(__file__).parents[1] / "postgres_backend.py").read_text(encoding="utf-8")

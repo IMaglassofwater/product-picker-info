@@ -10,6 +10,9 @@ from user_voice import extract_user_voice, summarize_user_voice
 
 
 DIRECTION_RULES = (
+    (r"\bmagnetic clips?\b|\bfridge magnets?\b", "magnetic-fridge-clip", "Magnetic Fridge Clip", "冰箱磁吸夹", "吸附在冰箱等金属表面、用于夹持便签或轻小物品的磁性夹具。"),
+    (r"\bhandheld misting fan\b", "handheld-misting-fan", "Handheld Misting Fan", "手持喷雾风扇", "将便携风扇与细雾喷洒功能结合的手持降温设备。"),
+    (r"\bbasedash ai sources\b", "ai-answer-source-tracing", "AI Answer Source Tracing Tool", "AI 回答来源追溯工具", "展示生成 AI 回答所依据来源的软件工具，帮助用户核对回答的构建依据。"),
     (r"\bolight ostation 2\b", "smart-battery-management-hub", "Olight Ostation 2 Battery Hub", "智能电池管理与充电设备", "集中存放、检测并充电 AA/AAA 镍氢电池和兼容锂电池的电池管理设备。"),
     (r"\bweershun travel pillow\b", "chin-support-travel-pillow", "WEERSHUN Travel Pillow", "环绕下巴的记忆棉旅行颈枕", "通过环绕下巴的记忆棉结构为飞机、汽车和办公休息提供头颈支撑的旅行枕。"),
     (r"\bhoverair versa\b", "flying-pocket-camera", "HOVERAir VERSA", "可手持与自主飞行的口袋相机", "兼具手持拍摄和自主飞行模式的便携口袋相机，HOVERAir VERSA 保留为产品名。"),

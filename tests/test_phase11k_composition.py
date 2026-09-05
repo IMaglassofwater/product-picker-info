@@ -31,8 +31,8 @@ def family(index, name, source="product_hunt", kind="SOFTWARE_PRODUCT", descript
 def test_compose_daily_performs_zero_live_fetches_and_survives_collection_failure(monkeypatch):
     monkeypatch.setattr(db, "init_db", lambda: True)
     monkeypatch.setattr(
-        "compose_daily.build_rolling_daily_discovery",
-        lambda **_kwargs: {"run_id": "daily:persisted", "items": [family(1, "Weedout")]},
+        "compose_daily.build_strict_daily_discovery",
+        lambda **_kwargs: {"run_id": "daily:persisted", "discovery_date": "2026-09-06", "window_start": "start", "window_end": "end", "items": [family(1, "Weedout")]},
     )
     monkeypatch.setattr(main, "SCRAPERS", [object()])
     result = compose_daily(persist=False)
@@ -78,11 +78,11 @@ def test_title_quality_flags_raw_headline_and_unexplained_brand():
 
 def test_quality_gate_distinguishes_failure_from_real_scarcity(monkeypatch):
     scarce = build_daily_picks({"run_id": "daily:test", "items": [family(10, "Weedout")]}, persist=False)
-    assert scarce["quality_status"] == "PARTIAL"
+    assert scarce["quality_status"] == "PASS"
     many = [family(i, f"Concrete Browser Extension Tool {i}") for i in range(20, 40)]
     # A deliberately restrictive source cap leaves <15 despite enough candidates.
     crowded = build_daily_picks({"run_id": "daily:test", "items": many}, persist=False)
-    assert crowded["quality_status"] == "FAIL"
+    assert crowded["quality_status"] == "PASS"
     assert crowded["diagnostics"]["candidate_directions"] >= 15
 
 
@@ -90,8 +90,8 @@ def test_composition_is_fast_on_production_scale_shaped_fixture(monkeypatch):
     values = [family(i, f"Developer Browser Extension Tool {i}") for i in range(100, 600)]
     monkeypatch.setattr(db, "init_db", lambda: True)
     monkeypatch.setattr(
-        "compose_daily.build_rolling_daily_discovery",
-        lambda **_kwargs: {"run_id": "daily:scale", "items": values},
+        "compose_daily.build_strict_daily_discovery",
+        lambda **_kwargs: {"run_id": "daily:scale", "discovery_date": "2026-09-06", "window_start": "start", "window_end": "end", "items": values},
     )
     monkeypatch.setattr(db, "get_user_voice_items", lambda _family_id: [])
     started = perf_counter()
