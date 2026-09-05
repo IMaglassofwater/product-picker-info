@@ -1578,6 +1578,96 @@ def get_latest_completed_run() -> dict | None:
         return None
 
 
+def get_recent_completed_run_ids(cutoff_timestamp: str) -> list[str]:
+    """Return completed/partial run IDs with observations inside a real time window."""
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT r.run_id, r.finished_at
+                   FROM pipeline_runs r
+                   JOIN product_observations o ON o.pipeline_run_id=r.run_id
+                   WHERE r.status IN ('COMPLETED','PARTIAL')
+                     AND r.finished_at IS NOT NULL AND o.observed_at>=?
+                   ORDER BY r.finished_at DESC, r.run_id DESC""",
+                (cutoff_timestamp,),
+            ).fetchall()
+        return [str(row["run_id"]) for row in rows]
+    except Exception:
+        return []
+
+
+def get_recent_daily_discovery(cutoff_timestamp: str) -> list[dict]:
+    """Load the rolling eligible evidence pool with three bounded batch queries."""
+    try:
+        with _connect() as connection:
+            families = connection.execute(
+                """SELECT f.id AS family_id, f.canonical_name, f.canonical_name_zh,
+                          f.primary_category, f.product_type, f.first_seen_at, f.last_seen_at,
+                          MAX(o.observed_at) AS latest_observed_at
+                   FROM product_observations o
+                   JOIN products p ON p.id=o.product_id
+                   JOIN product_eligibility e ON e.product_id=p.id
+                   JOIN product_family_members fm ON fm.product_id=p.id
+                   JOIN product_families f ON f.id=fm.family_id
+                   WHERE o.observed_at>=? AND e.eligibility_status='ELIGIBLE'
+                     AND e.concrete_product_status='CONCRETE' AND f.status='ACTIVE'
+                   GROUP BY f.id,f.canonical_name,f.canonical_name_zh,f.primary_category,
+                            f.product_type,f.first_seen_at,f.last_seen_at""",
+                (cutoff_timestamp,),
+            ).fetchall()
+            records = connection.execute(
+                """SELECT DISTINCT fm.family_id,p.source_platform,p.url,p.id AS product_id,
+                          p.title AS source_title,p.category,p.description,p.raw_data
+                   FROM product_observations o JOIN products p ON p.id=o.product_id
+                   JOIN product_eligibility e ON e.product_id=p.id
+                   JOIN product_family_members fm ON fm.product_id=p.id
+                   JOIN product_families f ON f.id=fm.family_id
+                   WHERE o.observed_at>=? AND e.eligibility_status='ELIGIBLE'
+                     AND e.concrete_product_status='CONCRETE' AND f.status='ACTIVE'
+                   ORDER BY fm.family_id,p.source_platform,p.id""",
+                (cutoff_timestamp,),
+            ).fetchall()
+            evidence = connection.execute(
+                """SELECT s.family_id,s.source_platform,s.metric_name,s.numeric_value,s.text_value
+                   FROM source_evidence_snapshots s
+                   JOIN product_families f ON f.id=s.family_id
+                   WHERE s.observed_at>=? AND f.status='ACTIVE'
+                   ORDER BY s.family_id,s.source_platform,s.metric_name""",
+                (cutoff_timestamp,),
+            ).fetchall()
+        records_by_family: dict[int, list[dict]] = {}
+        for row in records:
+            value = dict(row); value["raw_data"] = _decode_json(value.get("raw_data"), {})
+            records_by_family.setdefault(int(value.pop("family_id")), []).append(value)
+        evidence_by_family: dict[int, list[dict]] = {}
+        for row in evidence:
+            value = dict(row)
+            evidence_by_family.setdefault(int(value.pop("family_id")), []).append(value)
+        from evidence_foundation import EvidenceFact, assess_evidence_strength
+        output = []
+        for row in families:
+            item = dict(row); family_id = int(item["family_id"])
+            source_records = records_by_family.get(family_id, [])
+            item["source_records"] = source_records
+            item["source_platforms"] = sorted({r["source_platform"] for r in source_records})
+            descriptions = [" ".join(str(r.get("description") or "").split()) for r in source_records if str(r.get("description") or "").strip()]
+            item["factual_description"] = min(descriptions, key=len)[:300] if descriptions else ""
+            evidence_rows = evidence_by_family.get(family_id, [])
+            grouped: dict[str, list] = {}
+            for fact in evidence_rows:
+                grouped.setdefault(fact["source_platform"], []).append(EvidenceFact(fact["metric_name"], fact["numeric_value"], fact["text_value"]))
+            assessments = [assess_evidence_strength(source, facts, independent_source_count=len(item["source_platforms"])) for source, facts in grouped.items()]
+            order = {"WEAK": 0, "MODERATE": 1, "STRONG": 2}
+            strongest = max(assessments, key=lambda value: order[value.strength], default=None)
+            item["evidence_strength"] = strongest.strength if strongest else "WEAK"
+            item["evidence_reasons"] = strongest.reasons if strongest else ["No source-native market metrics are currently available."]
+            item["evidence_facts"] = evidence_rows
+            output.append(item)
+        return output
+    except Exception:
+        return []
+
+
 def get_observations_for_run(run_id: str) -> list[dict]:
     try:
         with _connect() as connection:
@@ -1915,6 +2005,32 @@ def get_user_voice_items(family_id: int) -> list[dict]:
         return [{**dict(row), "engagement": _decode_json(row["engagement_json"], {})} for row in rows]
     except Exception:
         return []
+
+
+def get_user_voice_items_map(family_ids: list[int]) -> dict[int, list[dict]]:
+    """Load persisted voice for a composition pool in one query."""
+    if not family_ids:
+        return {}
+    try:
+        with _connect() as connection:
+            if DATABASE_SETTINGS.backend == "postgresql":
+                rows = connection.execute(
+                    "SELECT * FROM user_voice_items WHERE product_family_id = ANY(?) ORDER BY product_family_id,retrieved_at,id",
+                    (family_ids,),
+                ).fetchall()
+            else:
+                placeholders = ",".join("?" for _ in family_ids)
+                rows = connection.execute(
+                    f"SELECT * FROM user_voice_items WHERE product_family_id IN ({placeholders}) ORDER BY product_family_id,retrieved_at,id",
+                    tuple(family_ids),
+                ).fetchall()
+        output: dict[int, list[dict]] = {}
+        for row in rows:
+            value = dict(row); value["engagement"] = _decode_json(value.get("engagement_json"), {})
+            output.setdefault(int(value["product_family_id"]), []).append(value)
+        return output
+    except Exception:
+        return {}
 
 
 def is_notification_delivered(delivery_key: str) -> bool:

@@ -31,10 +31,16 @@ PRODUCT_OBJECT_HINTS = (
     "bag", "backpack", "jacket", "camera", "chair", "keyboard", "tool", "blade",
     "tumbler", "bottle", "clip", "magnet", "watering can", "lamp", "holder",
     "case", "pillow", "wallet", "organizer", "shoe", "device", "battery",
+    "tent", "watch", "card", "vacuum", "purifier", "jacket", "computer", "mattress",
 )
 SOFTWARE_OBJECT_HINTS = ("software", "app", "platform", "dashboard", "browser", "extension", "api", "tool")
 SOFTWARE_SPECIFIC_HINTS = SOFTWARE_OBJECT_HINTS + (
     "agent", "model", "editor", "recorder", "workspace", "developer", "automation",
+)
+ARTICLE_HEADLINE_PATTERNS = (
+    r"^(how|why)\b", r"^running\b.+\bon\b", r"\bhow .+ redefined\b",
+    r"\b(best|top) \d+\b", r"[,;:].+\band\b.+[,;]", r"^most .+[,;]",
+    r"\bworld.s first\b.+\b(hotel|festival|exhibition)\b",
 )
 SOURCE_LABELS = {
     "amazon": "Amazon", "kickstarter": "Kickstarter", "indiegogo": "Indiegogo",
@@ -138,10 +144,32 @@ def _is_product_pick(item: dict) -> bool:
     text = " ".join((str(item.get("canonical_name") or ""), str(item.get("factual_description") or ""))).casefold()
     if any(re.search(pattern, text) for pattern in NON_PRODUCT_PICK_PATTERNS):
         return False
+    name = str(item.get("canonical_name") or "").strip()
+    if any(re.search(pattern, name, re.I) for pattern in ARTICLE_HEADLINE_PATTERNS):
+        return False
+    if name.count(",") >= 2 and re.search(r"\band\b", name, re.I):
+        return False
     if primary_source(item) in {"kickstarter", "indiegogo"}:
         hints = SOFTWARE_OBJECT_HINTS if item.get("product_type") == "SOFTWARE_PRODUCT" else PRODUCT_OBJECT_HINTS
         return any(re.search(rf"\b{re.escape(hint)}s?\b", text) for hint in hints)
+    if "brand_only_unexplained" in title_quality_flags(item):
+        return False
     return True
+
+
+def title_quality_flags(item: dict) -> list[str]:
+    name = str(item.get("canonical_name") or "").strip()
+    explanatory_text = " ".join((name, str(item.get("factual_description") or "")))
+    flags = []
+    if (len(name) > 90 or any(re.search(pattern, name, re.I) for pattern in ARTICLE_HEADLINE_PATTERNS)
+            or (name.count(",") >= 2 and re.search(r"\band\b", name, re.I))):
+        flags.append("article_headline")
+    if len(name.split()) >= 10 or name.endswith(("?", "!")):
+        flags.append("raw_title_like")
+    product_words = PRODUCT_OBJECT_HINTS + SOFTWARE_SPECIFIC_HINTS
+    if len(name.split()) <= 2 and not any(re.search(rf"\b{re.escape(word)}s?\b", explanatory_text, re.I) for word in product_words):
+        flags.append("brand_only_unexplained")
+    return flags
 
 
 def _basket(item: dict) -> str:
@@ -249,9 +277,12 @@ def select_daily_picks(dataset: dict, *, target: int = 20, exploration_slots: in
 def build_daily_picks(dataset: dict, *, persist: bool = True, target: int = 20) -> dict:
     items = select_daily_picks(dataset, target=target)
     voice_by_family = {}
+    stored_voice = db.get_user_voice_items_map([
+        int(item["family_id"]) for item in dataset.get("items", [])
+    ])
     for item in dataset.get("items", []):
         family_id = int(item["family_id"])
-        stored = db.get_user_voice_items(family_id) if persist else []
+        stored = stored_voice.get(family_id, [])
         voice_by_family[family_id] = normalize_user_voice_items(stored) if stored else extract_user_voice(item)
     for item in items:
         item["user_voice"] = [
@@ -272,6 +303,12 @@ def build_daily_picks(dataset: dict, *, persist: bool = True, target: int = 20) 
                 prepared_voice.append(value)
         item["user_voice"] = prepared_voice[:5]
         item["user_voice_summary"] = summarize_user_voice(item["user_voice"])
+    prepared = [prepare_discovery_item(item) for item in dataset.get("items", [])]
+    all_directions = build_product_directions(prepared)
+    concrete = [item for item in all_directions if _is_product_pick(item)]
+    rejected = [item for item in all_directions if not _is_product_pick(item)]
+    flags = [flag for item in items for flag in title_quality_flags(item)]
+    quality = "PASS" if len(items) >= 15 else "FAIL" if len(concrete) >= 15 else "PARTIAL"
     result = {
         "daily_discovery_run_id": dataset["run_id"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -281,6 +318,24 @@ def build_daily_picks(dataset: dict, *, persist: bool = True, target: int = 20) 
         "shortage_reason": "" if len(items) >= target else (
             f"Only {len(items)} qualified distinct product directions remained after identity, evidence, source-cap, and narrow-aggregation checks."
         ),
+        "quality_status": quality,
+        "diagnostics": {
+            "eligible_identities": len(prepared), "eligible_families": len(prepared),
+            "candidate_directions": len(all_directions), "rejected_concrete_gate": len(rejected),
+            "rejected_duplicate": max(0, len(concrete) - len(items)), "rejected_stale": 0,
+            "rejected_missing_description": sum(not str(x.get("factual_description") or "").strip() for x in prepared),
+            "direction_count": len(items),
+            "source_distribution": {s: sum(s in x.get("source_platforms", []) for x in items) for s in sorted({s for x in items for s in x.get("source_platforms", [])})},
+            "category_distribution": {k: sum(x.get("product_type") == k for x in items) for k in sorted({str(x.get("product_type")) for x in items})},
+            "multi_member_count": sum(len(x.get("member_family_ids", [])) > 1 for x in items),
+            "singleton_count": sum(len(x.get("member_family_ids", [])) == 1 for x in items),
+            "multi_source_count": sum(len(x.get("source_platforms", [])) > 1 for x in items),
+            "user_voice_count": sum(len(x.get("user_voice", [])) for x in items),
+            "missing_chinese_translation_count": sum(not x.get("canonical_name_zh") or not x.get("description_zh") for x in items),
+            "raw_title_like_count": flags.count("raw_title_like"),
+            "article_headline_count": flags.count("article_headline"),
+            "brand_only_unexplained_count": flags.count("brand_only_unexplained"),
+        },
     }
     if persist:
         from daily_direction_report import prepare_daily_payload

@@ -10,6 +10,21 @@ from user_voice import extract_user_voice, summarize_user_voice
 
 
 DIRECTION_RULES = (
+    (r"\bolight ostation 2\b", "smart-battery-management-hub", "Olight Ostation 2 Battery Hub", "智能电池管理与充电设备", "集中存放、检测并充电 AA/AAA 镍氢电池和兼容锂电池的电池管理设备。"),
+    (r"\bweershun travel pillow\b", "chin-support-travel-pillow", "WEERSHUN Travel Pillow", "环绕下巴的记忆棉旅行颈枕", "通过环绕下巴的记忆棉结构为飞机、汽车和办公休息提供头颈支撑的旅行枕。"),
+    (r"\bhoverair versa\b", "flying-pocket-camera", "HOVERAir VERSA", "可手持与自主飞行的口袋相机", "兼具手持拍摄和自主飞行模式的便携口袋相机，HOVERAir VERSA 保留为产品名。"),
+    (r"\bnfc energy-harvesting pcb business card\b", "nfc-energy-harvesting-business-card", "NFC Energy-Harvesting Business Card", "NFC 能量采集电子名片", "利用 NFC 能量采集为板载微控制器供电的 PCB 电子名片。"),
+    (r"\b5 in 1 convertible jacket\b", "convertible-jacket-backpack", "5-in-1 Convertible Jacket and Backpack", "五合一可转换夹克与背包", "可在夹克、背包、枕头或收纳形态之间转换的组合式随身产品。"),
+    (r"\byeti rambler\b.*\bstraw mug\b", "insulated-straw-mug", "YETI Rambler Straw Mug", "带吸管的保温随行杯", "带吸管杯盖的保温随行杯，YETI Rambler 保留为代表产品名。"),
+    (r"\bmet through sally\b", "interest-based-social-app", "Met Through Sally Social App", "兴趣匹配的线下社交应用", "根据共同兴趣帮助城市用户在线下认识他人的会员制社交应用。"),
+    (r"\bstep stool\b.*\bentryway\b", "entryway-step-stool", "Entryway Step Stool", "适合玄关摆放的踏脚凳", "兼顾登高使用与玄关环境摆放的踏脚凳产品方向。"),
+    (r"\banker mindbase\b", "camera-local-ai-storage-hub", "Anker MindBase Camera Hub", "摄像头 AI 本地存储中枢", "为兼容摄像头提供本地存储与 AI 处理能力的设备中枢，Anker MindBase 保留为产品名。"),
+    (r"\bqwen\b|slotstream", "local-llm-low-memory", "Low-memory Mac Local LLM Tool", "低内存 Mac 本地大模型运行工具", "帮助内存受限的 Mac 在本地运行大语言模型的软件工具，具体兼容性以公开项目资料为准。"),
+    (r"\bweedout\b", "youtube-ai-video-filter", "Weedout Browser Extension", "过滤 YouTube AI 生成视频的浏览器扩展", "Weedout 是用于识别或过滤 YouTube AI 生成视频的浏览器扩展；Weedout 保留为产品名。"),
+    (r"\bowntime\b", "flexible-time-planner", "OwnTime Planning App", "灵活时间块与生活角色规划应用", "OwnTime 是用灵活时间块和生活角色组织日程的规划应用；OwnTime 保留为产品名。"),
+    (r"\bwaltz\b", "room-scan-interior-design", "Waltz Interior Design App", "手机扫描房间的 AI 室内设计工具", "Waltz 是通过手机扫描房间并辅助室内设计的软件工具；Waltz 保留为产品名。"),
+    (r"\bgpd win max 3\b", "oled-handheld-gaming-pc", "GPD WIN Max 3", "可更换电池的 OLED 掌上游戏电脑", "GPD WIN Max 3 是采用 OLED 屏幕和可更换电池设计的掌上游戏电脑。"),
+    (r"\be[- ]?ink bike computer\b", "open-source-eink-bike-computer", "Open-source E-Ink Bike Computer", "开源电子墨水自行车码表", "使用电子墨水屏显示骑行信息的开源自行车码表。"),
     (r"\binsulated tumbler\b|\btumbler\b", "insulated-tumbler", "Insulated Tumbler", "保温杯", "双层保温的随身饮水容器，公开产品主要展示容量、杯盖、防漏和便携形态。"),
     (r"\bphone case\b|\botterbox\b.*\bcase\b", "phone-case", "Phone Case", "手机壳", "安装在手机外部的保护壳，公开资料涉及防摔、耐用性、结构磨损和保修体验。"),
     (r"\boutdoor rocking chair\b|\bpolywood\b.*\brock", "outdoor-rocking-chair", "Outdoor Rocking Chair", "户外摇椅", "适合门廊或庭院使用的摇椅，公开资料涉及户外耐候材料、结构耐久性和售后更换经历。"),

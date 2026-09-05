@@ -118,6 +118,36 @@ def build_daily_discovery(
     return result
 
 
+def build_rolling_daily_discovery(
+    *, days: int = 7, persist: bool = False, discovery_date: str | None = None,
+) -> dict:
+    """Compose from real persisted observations in a rolling time window."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    run_ids = db.get_recent_completed_run_ids(cutoff.isoformat())
+    items = [_snapshot_item(item) for item in db.get_recent_daily_discovery(cutoff.isoformat())]
+    items.sort(key=lambda value: (
+        EVIDENCE_ORDER.get(str(value.get("evidence_strength", "WEAK")).upper(), 3),
+        -_timestamp(value.get("latest_observed_at")),
+        str(value.get("canonical_name", "")).casefold(), int(value["family_id"]),
+    ))
+    for order, item in enumerate(items, 1):
+        item["display_order"] = order
+    anchor = run_ids[0] if run_ids else ""
+    result = {
+        "pipeline_run_id": anchor, "run_id": f"daily:{anchor}" if anchor else "rolling:empty",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "discovery_date": discovery_date or product_picker_business_date().isoformat(),
+        "items": items, "item_count": len(items), "window_days": max(1, days),
+        "source_run_ids": run_ids,
+    }
+    if persist and anchor:
+        result["run_id"] = db.persist_daily_discovery_snapshot(
+            anchor, items, discovery_date=result["discovery_date"],
+            metadata={"membership": "rolling persisted observations", "window_days": max(1, days), "source_run_ids": run_ids},
+        )
+    return result
+
+
 def load_daily_discovery(**identity: str) -> dict | None:
     return db.get_persisted_daily_discovery(**identity)
 
