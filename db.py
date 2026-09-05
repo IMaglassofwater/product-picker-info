@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from time import perf_counter
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -24,6 +26,9 @@ from performance_timing import timing_line
 DATABASE_SETTINGS = get_database_settings()
 DB_PATH = DATABASE_SETTINGS.sqlite_path or DEFAULT_SQLITE_PATH
 _INITIALIZED_POSTGRES_DATABASES: set[str] = set()
+_POSTGRES_STATEMENT_TIMEOUT_MS: ContextVar[int | None] = ContextVar(
+    "postgres_statement_timeout_ms", default=None,
+)
 
 
 def _decode_json(value, default):
@@ -39,11 +44,31 @@ def _text_timestamp(value) -> str:
 def _connect() -> sqlite3.Connection:
     if DATABASE_SETTINGS.backend == "postgresql":
         from postgres_backend import postgres_connection
-        return postgres_connection(DATABASE_SETTINGS.database_url)
+        return postgres_connection(
+            DATABASE_SETTINGS.database_url,
+            statement_timeout_ms=_POSTGRES_STATEMENT_TIMEOUT_MS.get(),
+        )
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+@contextmanager
+def bounded_postgres_statements(timeout_seconds: float | None):
+    """Bound each PostgreSQL statement for one orchestration stage.
+
+    SQLite remains unchanged. The ContextVar makes nested DB helpers inherit
+    the bound without changing their public APIs or leaking it to other runs.
+    """
+    timeout_ms = None
+    if timeout_seconds is not None and DATABASE_SETTINGS.backend == "postgresql":
+        timeout_ms = max(1, int(float(timeout_seconds) * 1000))
+    token = _POSTGRES_STATEMENT_TIMEOUT_MS.set(timeout_ms)
+    try:
+        yield
+    finally:
+        _POSTGRES_STATEMENT_TIMEOUT_MS.reset(token)
 
 
 def init_db() -> bool:

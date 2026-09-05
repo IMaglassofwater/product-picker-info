@@ -5,7 +5,9 @@ from pathlib import Path
 import sys
 import os
 import socket
-import threading
+import multiprocessing
+import pickle
+import tempfile
 import time
 
 import db
@@ -86,31 +88,60 @@ def _progress(output: Callable[[str], None], message: str) -> None:
         sys.stdout.flush()
 
 
+def _collector_process_entry(scraper: BaseScraper, result_path: str) -> None:
+    """Fetch/parse only; the parent remains the sole persistence owner."""
+    try:
+        payload = {"products": list(scraper.fetch())}
+    except BaseException as exc:
+        payload = {
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "is_scraper_error": isinstance(exc, ScraperError),
+        }
+    with open(result_path, "wb") as handle:
+        pickle.dump(payload, handle)
+
+
 def _fetch_with_wall_clock(scraper: BaseScraper, timeout_seconds: float) -> list[Product]:
-    """Bound one collector even when its internal network retries do not know the deadline."""
-    state: dict[str, object] = {}
-
-    def invoke() -> None:
+    """Run one collector in a killable spawn process with no DB ownership."""
+    descriptor, result_path = tempfile.mkstemp(prefix="product-picker-source-", suffix=".pickle")
+    os.close(descriptor)
+    context = multiprocessing.get_context("spawn")
+    worker = context.Process(
+        target=_collector_process_entry,
+        args=(scraper, result_path),
+        name=f"collector-{scraper.source_name}",
+    )
+    try:
+        worker.start()
+        worker.join(max(0.001, timeout_seconds))
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(2.0)
+            if worker.is_alive():
+                worker.kill()
+                worker.join(2.0)
+            raise ScraperFetchError(
+                f"{scraper.source_name} exceeded its source wall-clock budget; worker terminated"
+            )
+        if worker.exitcode != 0:
+            raise ScraperFetchError(
+                f"{scraper.source_name} collector exited with code {worker.exitcode}"
+            )
+        with open(result_path, "rb") as handle:
+            payload = pickle.load(handle)
+        if "error_type" in payload:
+            message = f"{scraper.source_name} failed: {payload['error_type']}: {payload['error_message']}"
+            raise ScraperFetchError(message)
+        return list(payload.get("products", []))
+    finally:
+        if worker.pid is not None and worker.is_alive():
+            worker.terminate()
+            worker.join(2.0)
         try:
-            state["products"] = scraper.fetch()
-        except BaseException as exc:  # transported back to the orchestration thread
-            state["error"] = exc
-
-    worker = threading.Thread(target=invoke, daemon=True)
-    worker.start()
-    worker.join(max(0.001, timeout_seconds))
-    if worker.is_alive():
-        raise ScraperFetchError(
-            f"{scraper.source_name} exceeded its source wall-clock budget"
-        )
-    error = state.get("error")
-    if error is not None:
-        if isinstance(error, ScraperError):
-            raise error
-        raise ScraperFetchError(
-            f"{scraper.source_name} failed: {type(error).__name__}"
-        ) from error
-    return list(state.get("products", []))
+            os.unlink(result_path)
+        except FileNotFoundError:
+            pass
 
 
 def run_pipeline(
@@ -362,19 +393,38 @@ def run_pipeline(
     for source_name, stats in source_stats.items():
         if stats["failed"]:
             continue
-        source_products = stats["products"]
-        with query_profile(output, "save", source=source_name):
-            source_saved, source_duplicates = db.save_products(
-                source_products,
-                filter_results,
-                feasibility_results,
-                record_role_results,
-                demand_signal_results,
-                demand_opportunity_results,
-                commodity_results,
-                timing_output=output,
-                initialize=False,
+        remaining = (
+            deadline_monotonic - monotonic()
+            if deadline_monotonic is not None else float("inf")
+        )
+        if remaining <= 1:
+            stats["failed"] = True
+            stats["error"] = "daily preparation budget exhausted before persistence"
+            _progress(
+                output,
+                f"PERSISTENCE_SKIPPED_BUDGET source={source_name} remaining_s={max(0, remaining):.3f}",
             )
+            if run_id:
+                db.record_pipeline_source_run(
+                    run_id, source_name, fetched=stats["fetched"], failed=True,
+                    error=stats["error"],
+                )
+            continue
+        source_products = stats["products"]
+        statement_budget = min(30.0, remaining)
+        with db.bounded_postgres_statements(statement_budget):
+            with query_profile(output, "save", source=source_name):
+                source_saved, source_duplicates = db.save_products(
+                    source_products,
+                    filter_results,
+                    feasibility_results,
+                    record_role_results,
+                    demand_signal_results,
+                    demand_opportunity_results,
+                    commodity_results,
+                    timing_output=output,
+                    initialize=False,
+                )
         if source_products and source_saved == 0 and source_duplicates == 0:
             stats["failed"] = True
             stats["error"] = "Database persistence failed"
@@ -392,9 +442,39 @@ def run_pipeline(
         # candidate creation, AI qualification, UI, or notification behavior.
         if run_id:
             from evidence_shadow import process_products_for_run
-            process_products_for_run(
-                run_id, source_products, existing_urls=existing_urls,
+            evidence_started = monotonic()
+            remaining = (
+                deadline_monotonic - monotonic()
+                if deadline_monotonic is not None else float("inf")
             )
+            with db.bounded_postgres_statements(min(30.0, remaining)):
+                projection = process_products_for_run(
+                    run_id, source_products, existing_urls=existing_urls,
+                    deadline_monotonic=deadline_monotonic, monotonic=monotonic,
+                )
+            _progress(
+                output,
+                "EVIDENCE_END "
+                f"source={source_name} processed={projection['processed']} "
+                f"failed={projection['failed']} "
+                f"deferred={projection['deferred']} "
+                f"elapsed_s={monotonic() - evidence_started:.3f} "
+                f"remaining_s={max(0, (deadline_monotonic - monotonic()) if deadline_monotonic is not None else 0):.3f}",
+            )
+            if projection["failed"] or projection["deferred"]:
+                stats["failed"] = True
+                stats["error"] = (
+                    "evidence projection failed or deferred by global budget"
+                )
+                _progress(
+                    output,
+                    f"EVIDENCE_PARTIAL source={source_name} "
+                    f"failed={projection['failed']} deferred={projection['deferred']}",
+                )
+                db.record_pipeline_source_run(
+                    run_id, source_name, fetched=stats["fetched"], failed=True,
+                    error=stats["error"],
+                )
     with timed_stage(output, "candidate_creation_update"):
         validated_candidates = [
             candidate

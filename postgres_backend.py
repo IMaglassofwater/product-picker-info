@@ -72,9 +72,20 @@ def _pool(database_url: str):
 
 
 @contextmanager
-def postgres_connection(database_url: str) -> Iterator[PostgresConnectionAdapter]:
+def postgres_connection(
+    database_url: str,
+    *,
+    statement_timeout_ms: int | None = None,
+) -> Iterator[PostgresConnectionAdapter]:
     """Borrow one bounded pooled connection and commit/rollback with context exit."""
     with _pool(database_url).connection() as connection:
+        if statement_timeout_ms is not None:
+            # SET LOCAL is transaction-scoped, so a returned pooled connection
+            # cannot leak this daily-run budget into Streamlit or later jobs.
+            connection.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (str(max(1, int(statement_timeout_ms))),),
+            )
         yield PostgresConnectionAdapter(connection)
 
 

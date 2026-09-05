@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import multiprocessing
+from pathlib import Path
 from time import perf_counter, sleep
 
 import db
@@ -74,6 +76,18 @@ class _SlowCollector:
         return []
 
 
+class _NonCooperativeCollector:
+    source_name = "noncooperative"
+
+    def __init__(self, marker: str):
+        self.marker = marker
+
+    def fetch(self):
+        sleep(0.2)
+        Path(self.marker).write_text("worker survived", encoding="utf-8")
+        return []
+
+
 def test_source_network_wall_clock_cannot_bypass_budget():
     started = perf_counter()
     try:
@@ -83,6 +97,22 @@ def test_source_network_wall_clock_cannot_bypass_budget():
     else:
         raise AssertionError("slow collector unexpectedly completed")
     assert perf_counter() - started < 0.15
+
+
+def test_noncooperative_collector_is_terminated_and_reaped(tmp_path):
+    marker = tmp_path / "survived.txt"
+    try:
+        main._fetch_with_wall_clock(_NonCooperativeCollector(str(marker)), 0.02)
+    except Exception as exc:
+        assert "worker terminated" in str(exc)
+    else:
+        raise AssertionError("noncooperative collector unexpectedly completed")
+    sleep(0.25)
+    assert not marker.exists()
+    assert not any(
+        child.name == "collector-noncooperative"
+        for child in multiprocessing.active_children()
+    )
 
 
 def test_actual_orchestration_reaches_daily_tail_after_slow_collectors(
@@ -112,11 +142,35 @@ def test_actual_orchestration_reaches_daily_tail_after_slow_collectors(
         ai_step=lambda: DailyAIResult(30), lock_path=tmp_path / "daily.lock",
         output=messages.append, preparation_budget_seconds=0.05,
     )
-    assert perf_counter() - started < 0.5
+    # Windows spawn startup is intentionally included; the important bound is
+    # that the non-cooperative work cannot approach its own sleep/runtime.
+    assert perf_counter() - started < 2.0
     assert result.status == "PARTIAL"
     assert tail == ["daily", "picks"]
     assert "DAILY_GENERATION_START" in messages
     assert any("SOURCE_SKIPPED_BUDGET" in value for value in messages)
+
+
+def test_short_budget_orchestration_persists_daily_run_and_completes(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "short-budget.db")
+    monkeypatch.setattr(
+        main, "SCRAPERS", [_SlowCollector("blocked", 5.0)],
+    )
+    monkeypatch.setattr(main.config, "DAILY_SOURCE_BUDGET_SECONDS", 0.03)
+    messages: list[str] = []
+
+    result = execute_daily(
+        ai_step=lambda: DailyAIResult(30), lock_path=tmp_path / "daily.lock",
+        output=messages.append, preparation_budget_seconds=0.05,
+    )
+
+    assert result.status == "PARTIAL"
+    assert "DAILY_GENERATION_START" in messages
+    with db._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM daily_discovery_runs"
+        ).fetchone()["count"] == 1
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
 def test_recent_persisted_daily_evidence_is_reused_without_fake_freshness(monkeypatch):

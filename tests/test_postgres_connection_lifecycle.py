@@ -92,6 +92,29 @@ def test_exception_cleanup_does_not_poison_next_request(monkeypatch):
     assert pool.exits == [RuntimeError, None]
 
 
+def test_statement_timeout_is_transaction_local_and_bounded(monkeypatch):
+    calls = []
+
+    class RawConnection:
+        def execute(self, sql, params=()):
+            calls.append((sql, params))
+
+    pool = type(
+        "Pool", (),
+        {"connection": lambda self: _ConnectionContext(RawConnection(), [])},
+    )()
+    monkeypatch.setattr(postgres_backend, "_pool", lambda _url: pool)
+
+    with postgres_backend.postgres_connection(
+        "postgresql://example.invalid/db", statement_timeout_ms=30_000,
+    ):
+        pass
+
+    assert calls == [
+        ("SELECT set_config('statement_timeout', %s, true)", ("30000",)),
+    ]
+
+
 def test_repeated_dashboard_snapshot_reads_do_not_mutate_sqlite():
     with db._connect() as connection:
         before = {

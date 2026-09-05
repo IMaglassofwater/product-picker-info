@@ -122,6 +122,19 @@ def test_daily_discovery_includes_all_eligible_families_without_ai_or_top_n(tmp_
         assert connection.execute("SELECT COUNT(*) FROM ai_triage_results").fetchone()[0] == 0
 
 
+def test_evidence_projection_defers_remaining_products_after_deadline(monkeypatch):
+    items = [product(index=41), product(index=42)]
+    monkeypatch.setattr(
+        db, "get_product_record_by_url",
+        lambda _url: (_ for _ in ()).throw(AssertionError("DB must not be touched")),
+    )
+    result = process_products_for_run(
+        "run-deadline", items, deadline_monotonic=10.0, monotonic=lambda: 10.0,
+    )
+    assert result["processed"] == 0
+    assert result["deferred"] == 2
+
+
 def test_ambiguous_records_are_observed_but_not_in_discovery(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "ambiguous.sqlite")
     item = product("reddit_arctic_shift", "Thoughts?", "Interesting idea", index=4)

@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 import json
 from types import SimpleNamespace
 import sys
+import time
 from typing import Iterable
 
 import db
@@ -66,23 +67,42 @@ def process_products_for_run(
     products: Iterable[Product],
     *,
     existing_urls: set[str] | None = None,
+    deadline_monotonic: float | None = None,
+    monotonic=time.monotonic,
 ) -> dict:
     """Record run membership after the legacy source batch saved successfully."""
     existing = existing_urls or set()
+    items = list(products)
     results = []
-    for product in products:
+    deferred = 0
+    failed = 0
+    for index, product in enumerate(items):
+        if deadline_monotonic is not None and monotonic() >= deadline_monotonic:
+            deferred += len(items) - index
+            break
         record = db.get_product_record_by_url(product.url)
         if not record:
-            continue
-        results.append(project_product(
+            failed += 1
+            deferred += len(items) - index - 1
+            break
+        projected = project_product(
             record["id"], product, run_id=run_id,
             was_new=product.url not in existing,
             was_updated=product.url in existing,
-        ))
-    db.refresh_shadow_family_canonical_names()
-    db.prune_empty_shadow_families()
+        )
+        if not projected["observed"]:
+            failed += 1
+            deferred += len(items) - index - 1
+            break
+        results.append(projected)
+    if deadline_monotonic is None or monotonic() < deadline_monotonic:
+        db.refresh_shadow_family_canonical_names()
+    if deadline_monotonic is None or monotonic() < deadline_monotonic:
+        db.prune_empty_shadow_families()
     return {
         "processed": len(results),
+        "failed": failed,
+        "deferred": deferred,
         "observed": sum(bool(item["observed"]) for item in results),
         "eligible": sum(item["eligibility"].eligibility_status == "ELIGIBLE" for item in results),
         "ineligible": sum(item["eligibility"].eligibility_status == "INELIGIBLE" for item in results),
