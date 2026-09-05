@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import os
 import socket
+import threading
 import time
 
 import db
@@ -28,7 +29,7 @@ from rule_filter import filter_product
 from performance_timing import query_profile, timed_stage
 from scrapers.arctic_shift import ArcticShiftScraper
 from scrapers.amazon_trends import AmazonTrendScraper, filter_amazon_trend
-from scrapers.base_scraper import BaseScraper, ScraperError
+from scrapers.base_scraper import BaseScraper, ScraperError, ScraperFetchError
 from scrapers.kickstarter import KickstarterScraper
 from scrapers.indiegogo import IndiegogoScraper
 from scrapers.product_hunt import ProductHuntScraper
@@ -79,6 +80,39 @@ SCRAPERS: list[BaseScraper] = [
 ]
 
 
+def _progress(output: Callable[[str], None], message: str) -> None:
+    output(message)
+    if output is print:
+        sys.stdout.flush()
+
+
+def _fetch_with_wall_clock(scraper: BaseScraper, timeout_seconds: float) -> list[Product]:
+    """Bound one collector even when its internal network retries do not know the deadline."""
+    state: dict[str, object] = {}
+
+    def invoke() -> None:
+        try:
+            state["products"] = scraper.fetch()
+        except BaseException as exc:  # transported back to the orchestration thread
+            state["error"] = exc
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    worker.join(max(0.001, timeout_seconds))
+    if worker.is_alive():
+        raise ScraperFetchError(
+            f"{scraper.source_name} exceeded its source wall-clock budget"
+        )
+    error = state.get("error")
+    if error is not None:
+        if isinstance(error, ScraperError):
+            raise error
+        raise ScraperFetchError(
+            f"{scraper.source_name} failed: {type(error).__name__}"
+        ) from error
+    return list(state.get("products", []))
+
+
 def run_pipeline(
     scrapers: Iterable[BaseScraper] | None = None,
     output: Callable[[str], None] = print,
@@ -87,6 +121,7 @@ def run_pipeline(
     finish_run: bool = True,
     deadline_monotonic: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    per_source_budget_seconds: float | None = None,
 ) -> bool:
     """Fetch all sources independently, filter products, and save them."""
     output(SEPARATOR)
@@ -106,10 +141,23 @@ def run_pipeline(
     products: list[Product] = []
     total_fetched = 0
     active_scrapers = list(scrapers if scrapers is not None else SCRAPERS)
+    if deadline_monotonic is not None and len(active_scrapers) > 1:
+        from business_time import product_picker_business_date
+        offset = product_picker_business_date().toordinal() % len(active_scrapers)
+        active_scrapers = active_scrapers[offset:] + active_scrapers[:offset]
+    source_cap = float(per_source_budget_seconds or config.DAILY_SOURCE_BUDGET_SECONDS)
     for scraper_index, scraper in enumerate(active_scrapers):
-        if deadline_monotonic is not None and monotonic() >= deadline_monotonic:
-            output("Daily preparation budget reached; remaining sources deferred")
+        remaining = (
+            deadline_monotonic - monotonic()
+            if deadline_monotonic is not None else float("inf")
+        )
+        if remaining <= 1:
+            _progress(output, "COLLECTION_PARTIAL reason=global_budget_exhausted")
             for deferred in active_scrapers[scraper_index:]:
+                _progress(
+                    output,
+                    f"SOURCE_SKIPPED_BUDGET source={deferred.source_name} remaining_s={max(0, remaining):.3f}",
+                )
                 source_stats[deferred.source_name] = {
                     "fetched": 0, "products": [], "failed": True,
                     "error": "daily preparation budget exhausted",
@@ -126,9 +174,15 @@ def run_pipeline(
         )
         output("\nSource:")
         output(source_label)
+        source_started = monotonic()
+        allowed = min(source_cap, remaining)
+        _progress(
+            output,
+            f"SOURCE_START source={scraper.source_name} allowed_s={allowed:.3f} remaining_s={remaining:.3f}",
+        )
         try:
             with timed_stage(output, "fetch", source=scraper.source_name):
-                source_products = scraper.fetch()
+                source_products = _fetch_with_wall_clock(scraper, allowed)
         except ScraperError as exc:
             output("Unavailable")
             output(f"Reason: {exc}")
@@ -141,6 +195,10 @@ def run_pipeline(
                 db.record_pipeline_source_run(
                     run_id, scraper.source_name, failed=True, error=str(exc)
                 )
+            _progress(
+                output,
+                f"SOURCE_END source={scraper.source_name} status=failed elapsed_s={monotonic() - source_started:.3f} remaining_s={max(0, (deadline_monotonic - monotonic()) if deadline_monotonic is not None else 0):.3f}",
+            )
             continue
         fetched_count = len(source_products)
         limit = MAX_ITEMS_PER_SOURCE.get(scraper.source_name, 50)
@@ -153,6 +211,15 @@ def run_pipeline(
         }
         output(f"Fetched:\n{len(source_products)}")
         output(f"Processed:\n{len(processed_products)}")
+        _progress(
+            output,
+            f"SOURCE_END source={scraper.source_name} status=success elapsed_s={monotonic() - source_started:.3f} remaining_s={max(0, (deadline_monotonic - monotonic()) if deadline_monotonic is not None else 0):.3f}",
+        )
+
+    _progress(
+        output,
+        "COLLECTION_PARTIAL" if any(value["failed"] for value in source_stats.values()) else "COLLECTION_COMPLETE",
+    )
 
     results = []
     filter_results = {}

@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
+import sys
 from time import perf_counter
 from typing import Callable
 
@@ -24,9 +25,16 @@ from wxpusher_notifier import (
     WxPusherNotifier, notification_delivery_key, send_daily_notification,
     send_full_fidelity_daily,
 )
+from business_time import product_picker_business_date
 
 
 LOCK_PATH = Path(__file__).resolve().parent / "data" / "daily_pipeline.lock"
+
+
+def _progress(output: Callable[[str], None], message: str) -> None:
+    output(message)
+    if output is print:
+        sys.stdout.flush()
 
 
 @dataclass
@@ -254,6 +262,12 @@ def execute_daily(
         return DailyRunResult("", "FAILED", 0, "pipeline already running")
     run_id = ""
     try:
+        effective_date = discovery_date or product_picker_business_date().isoformat()
+        _progress(output, f"PIPELINE_START business_date={effective_date}")
+        _progress(
+            output,
+            f"GLOBAL_PRE_DAILY_DEADLINE budget_s={preparation_deadline - pipeline_started:.0f}",
+        )
         with query_profile(output, "database_init"):
             if not db.init_db():
                 return DailyRunResult("", "FAILED", 0, "database initialization failed")
@@ -283,6 +297,10 @@ def execute_daily(
         }
         source_rows, source_failures = _source_summary(run_id)
         try:
+            _progress(
+                output,
+                f"GEMINI_START remaining_budget_s={max(0, preparation_deadline - monotonic()):.3f}",
+            )
             ai_value = ai_step() if ai_step else run_daily_triage(
                 new_candidate_ids=new_candidate_ids,
                 opportunities=opportunities,
@@ -300,6 +318,10 @@ def execute_daily(
                 for item in load_current_opportunities()
             )
             ai.errors.append(f"Gemini unavailable ({type(exc).__name__})")
+        _progress(
+            output,
+            f"GEMINI_END attempted={ai.calls} completed={ai.successful} failed={ai.failed} skipped_budget={int(ai.budget_exhausted)} remaining_budget_s={max(0, preparation_deadline - monotonic()):.3f}",
+        )
 
         with query_profile(output, "opportunity_loading_post_gemini"):
             ranking_opportunities = load_current_opportunities()
@@ -353,13 +375,18 @@ def execute_daily(
         try:
             from daily_discovery import build_daily_discovery
             from daily_picks import build_daily_picks
-            snapshot = build_daily_discovery(run_id, discovery_date=discovery_date)
+            _progress(output, "DAILY_GENERATION_START")
+            snapshot = build_daily_discovery(run_id, discovery_date=effective_date)
             stats["daily_discovery_count"] = snapshot["item_count"]
             daily_picks = build_daily_picks(snapshot, persist=True)
             stats["daily_picks_run_id"] = daily_picks.get("run_id", "")
             stats["daily_picks_count"] = daily_picks.get("item_count", 0)
+            _progress(
+                output,
+                f"DAILY_PERSISTED run_id={daily_picks.get('run_id', '')} directions={daily_picks.get('item_count', 0)}",
+            )
         except Exception as exc:
-            output(f"WARNING: Daily Discovery snapshot unavailable ({type(exc).__name__})")
+            _progress(output, f"DAILY_PERSIST_FAILED error_type={type(exc).__name__}")
         return DailyRunResult(run_id, status, ai.pending, error, stats)
     except Exception as exc:
         if run_id:
@@ -371,6 +398,7 @@ def execute_daily(
         )
     finally:
         lock.release()
+        _progress(output, "PIPELINE_END")
         output(timing_line(
             stage="pipeline_total", duration_s=monotonic() - pipeline_started,
         ))
@@ -459,10 +487,13 @@ def main() -> int:
         )
     if os.getenv("EVIDENCE_FIRST_WXPUSHER_ENABLED", "false").lower() in {"1", "true", "yes"}:
         try:
+            _progress(print, "WXPUSHER_START")
             persisted = db.get_persisted_daily_picks(run_id=result.stats.get("daily_picks_run_id"))
             if result.status != "FAILED" and persisted:
                 from daily_direction_report import validate_notification_snapshot
                 validate_notification_snapshot(persisted)
+                _progress(print, "INTEGRITY_PASS")
+                _progress(print, "PARITY_PASS")
                 sender = WxPusherNotifier.from_env()
                 acceptance_key, _recipient_hash = notification_delivery_key(
                     str(persisted["run_id"]), sender.uid,
@@ -478,13 +509,14 @@ def main() -> int:
                     persisted, notifier=sender, is_delivered=already_delivered,
                     record_delivery=db.record_notification_delivery,
                 )
+                _progress(print, "WXPUSHER_RESULT status=completed_or_idempotent")
             elif result.status == "FAILED":
                 send_daily_notification(DailyNotificationSummary(
                     status=result.status, failed_sources=source_failures,
                     failed_stage="Daily Pipeline", error=result.error, run_url=run_url,
                 ))
         except Exception as exc:
-            print(f"WARNING: WxPusher notification failed ({type(exc).__name__})")
+            _progress(print, f"INTEGRITY_OR_WXPUSHER_FAIL error_type={type(exc).__name__}")
     print(f"Daily Product Picker: {result.status}")
     print(f"AI Pending: {result.ai_pending}")
     if result.error:

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Iterable
 
 import db
+import config
 from business_time import product_picker_business_date
 
 EVIDENCE_ORDER = {"STRONG": 0, "MODERATE": 1, "WEAK": 2}
@@ -63,9 +65,31 @@ def _snapshot_item(item: dict) -> dict:
 
 def build_daily_discovery(
     pipeline_run_id: str, *, persist: bool = True, discovery_date: str | None = None,
+    reuse_recent_persisted: bool = True,
 ) -> dict:
     """Build one complete run-scoped snapshot without AI or legacy ranking gates."""
     items = [_snapshot_item(value) for value in db.get_daily_discovery(pipeline_run_id)]
+    reused_family_ids: list[int] = []
+    if reuse_recent_persisted and len(items) < 20:
+        previous = db.get_persisted_daily_discovery()
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=config.DAILY_EVIDENCE_FRESHNESS_DAYS
+        )
+        current_ids = {int(value["family_id"]) for value in items}
+        for value in (previous or {}).get("items", []):
+            family_id = int(value.get("family_id", 0) or 0)
+            try:
+                observed = datetime.fromisoformat(
+                    str(value.get("latest_observed_at", "")).replace("Z", "+00:00")
+                )
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if family_id and family_id not in current_ids and observed >= cutoff:
+                items.append(deepcopy(value))
+                current_ids.add(family_id)
+                reused_family_ids.append(family_id)
     items.sort(key=lambda value: (
         EVIDENCE_ORDER.get(str(value.get("evidence_strength", "WEAK")).upper(), 3),
         -_timestamp(value.get("latest_observed_at")),
@@ -84,7 +108,12 @@ def build_daily_discovery(
     if persist:
         result["run_id"] = db.persist_daily_discovery_snapshot(
             pipeline_run_id, items, discovery_date=result["discovery_date"],
-            metadata={"membership": "observed+eligible+concrete+active-family", "ordering": "evidence,freshness,identity"},
+            metadata={
+                "membership": "observed+eligible+concrete+active-family with bounded recent persisted fallback",
+                "ordering": "evidence,freshness,identity",
+                "reused_recent_family_ids": reused_family_ids,
+                "evidence_freshness_days": config.DAILY_EVIDENCE_FRESHNESS_DAYS,
+            },
         )
     return result
 

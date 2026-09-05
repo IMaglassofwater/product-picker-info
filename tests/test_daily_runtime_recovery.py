@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import perf_counter, sleep
 
 import db
+import main
 from business_time import product_picker_business_date
 from run_daily import DailyAIResult, execute_daily
 
@@ -60,3 +62,76 @@ def test_stale_running_pipeline_is_recovered_but_recent_one_is_preserved(tmp_pat
         "FAILED", "stale run recovered after external cancellation",
     )
     assert rows["recent"] == ("RUNNING", "")
+
+
+class _SlowCollector:
+    def __init__(self, source_name: str, delay: float):
+        self.source_name = source_name
+        self.delay = delay
+
+    def fetch(self):
+        sleep(self.delay)
+        return []
+
+
+def test_source_network_wall_clock_cannot_bypass_budget():
+    started = perf_counter()
+    try:
+        main._fetch_with_wall_clock(_SlowCollector("slow", 0.25), 0.02)
+    except Exception as exc:
+        assert "wall-clock budget" in str(exc)
+    else:
+        raise AssertionError("slow collector unexpectedly completed")
+    assert perf_counter() - started < 0.15
+
+
+def test_actual_orchestration_reaches_daily_tail_after_slow_collectors(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "daily.db")
+    monkeypatch.setattr(
+        main, "SCRAPERS",
+        [_SlowCollector(f"slow_{index}", 0.03) for index in range(4)],
+    )
+    monkeypatch.setattr(main.config, "DAILY_SOURCE_BUDGET_SECONDS", 0.04)
+    tail: list[str] = []
+
+    def discovery(run_id, **_kwargs):
+        tail.append("daily")
+        return {"run_id": f"daily:{run_id}", "items": [], "item_count": 0}
+
+    def picks(_snapshot, **_kwargs):
+        tail.append("picks")
+        return {"run_id": "picks:test", "item_count": 0, "items": []}
+
+    monkeypatch.setattr("daily_discovery.build_daily_discovery", discovery)
+    monkeypatch.setattr("daily_picks.build_daily_picks", picks)
+    messages: list[str] = []
+    started = perf_counter()
+    result = execute_daily(
+        ai_step=lambda: DailyAIResult(30), lock_path=tmp_path / "daily.lock",
+        output=messages.append, preparation_budget_seconds=0.05,
+    )
+    assert perf_counter() - started < 0.5
+    assert result.status == "PARTIAL"
+    assert tail == ["daily", "picks"]
+    assert "DAILY_GENERATION_START" in messages
+    assert any("SOURCE_SKIPPED_BUDGET" in value for value in messages)
+
+
+def test_recent_persisted_daily_evidence_is_reused_without_fake_freshness(monkeypatch):
+    from daily_discovery import build_daily_discovery
+
+    old = {
+        "family_id": 7, "canonical_name": "Existing product",
+        "canonical_name_zh": "已有产品", "factual_description": "Known facts",
+        "latest_observed_at": datetime.now(timezone.utc).isoformat(),
+        "evidence_strength": "MODERATE", "source_records": [],
+    }
+    monkeypatch.setattr(db, "get_daily_discovery", lambda _run_id: [])
+    monkeypatch.setattr(
+        db, "get_persisted_daily_discovery", lambda **_identity: {"items": [old]},
+    )
+    result = build_daily_discovery("new-run", persist=False)
+    assert [value["family_id"] for value in result["items"]] == [7]
+    assert result["items"][0]["latest_observed_at"] == old["latest_observed_at"]
